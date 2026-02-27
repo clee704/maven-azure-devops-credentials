@@ -23,6 +23,7 @@ import java.io.File;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.Before;
 import org.junit.Rule;
@@ -46,10 +47,6 @@ public class AzureDevOpsCredentialsIntegrationTest {
     //   ADO_TEST_GROUP_ID   - groupId of a test artifact in the feed
     //   ADO_TEST_ARTIFACT_ID - artifactId of a test artifact in the feed
     //   ADO_TEST_VERSION    - version of the test artifact
-    //
-    // Optionally, for scenario 3 (mixed auth):
-    //   ADO_MAVEN_FEED_URL_2 - URL of a second Azure DevOps Maven feed
-    //   ADO_MAVEN_FEED_ID_2  - repository ID for the second feed
 
     @Rule
     public TemporaryFolder tempFolder = new TemporaryFolder();
@@ -60,8 +57,13 @@ public class AzureDevOpsCredentialsIntegrationTest {
     private String artifactId;
     private String version;
 
+    private String projectVersion;
+
     @Before
     public void setUp() {
+        projectVersion = System.getProperty("project.version");
+        assumeTrue("project.version system property not set", projectVersion != null);
+
         feedUrl = System.getenv("ADO_MAVEN_FEED_URL");
         feedId = System.getenv("ADO_MAVEN_FEED_ID");
         groupId = System.getenv("ADO_TEST_GROUP_ID");
@@ -74,8 +76,8 @@ public class AzureDevOpsCredentialsIntegrationTest {
         assumeTrue("ADO_TEST_VERSION not set", version != null);
 
         File extensionJar = new File(System.getProperty("user.home"),
-                ".m2/repository/dev/chungmin/maven-azure-devops-credentials/0.0.1-SNAPSHOT/"
-                + "maven-azure-devops-credentials-0.0.1-SNAPSHOT.jar");
+                ".m2/repository/dev/chungmin/maven-azure-devops-credentials/" + projectVersion + "/"
+                + "maven-azure-devops-credentials-" + projectVersion + ".jar");
         assertTrue("Extension jar not found at " + extensionJar
                 + ". Run 'mvn install' first.", extensionJar.exists());
     }
@@ -105,31 +107,29 @@ public class AzureDevOpsCredentialsIntegrationTest {
                 repoXml(feedId, feedUrl),
                 dependencyXml(groupId, artifactId, version));
 
-        File userSettings = new File(System.getProperty("user.home"), ".m2/settings.xml");
-        assumeTrue("~/.m2/settings.xml not found, skipping", userSettings.exists());
-        assumeTrue("~/.m2/settings.xml has no entry for " + feedId,
-                settingsHasServer(userSettings, feedId));
+        String token = getAzureCliToken();
+        assumeTrue("Could not acquire token via 'az' CLI", token != null);
+        File settings = createSettingsWithToken(feedId, token);
 
-        int exitCode = runMaven(projectDir, userSettings);
+        int exitCode = runMaven(projectDir, settings);
         assertEquals("Scenario 2 (settings.xml only) should succeed", 0, exitCode);
     }
 
     /**
      * Scenario 3: settings.xml has credentials for one feed but not another.
-     * Extension should only invoke Azure Identity for the feed without credentials.
+     * The build should succeed with mixed auth sources.
      */
     @Test
     public void scenario3_mixed() throws Exception {
-        String feedUrl2 = System.getenv("ADO_MAVEN_FEED_URL_2");
-        String feedId2 = System.getenv("ADO_MAVEN_FEED_ID_2");
-        assumeTrue("ADO_MAVEN_FEED_URL_2 not set", feedUrl2 != null);
-        assumeTrue("ADO_MAVEN_FEED_ID_2 not set", feedId2 != null);
+        String feedId2 = feedId + "-noauth";
 
         File projectDir = createTestProject("scenario3",
-                repoXml(feedId, feedUrl) + repoXml(feedId2, feedUrl2),
+                repoXml(feedId, feedUrl) + repoXml(feedId2, feedUrl),
                 dependencyXml(groupId, artifactId, version));
 
-        File partialSettings = createSettingsWithServer(feedId);
+        String token = getAzureCliToken();
+        assumeTrue("Could not acquire token via 'az' CLI", token != null);
+        File partialSettings = createSettingsWithToken(feedId, token);
 
         int exitCode = runMaven(projectDir, partialSettings);
         assertEquals("Scenario 3 (mixed) should succeed", 0, exitCode);
@@ -153,7 +153,7 @@ public class AzureDevOpsCredentialsIntegrationTest {
                 + "  <extension>\n"
                 + "    <groupId>dev.chungmin</groupId>\n"
                 + "    <artifactId>maven-azure-devops-credentials</artifactId>\n"
-                + "    <version>0.0.1-SNAPSHOT</version>\n"
+                + "    <version>" + projectVersion + "</version>\n"
                 + "  </extension>\n"
                 + "</extensions>\n";
         writeFile(new File(mvnDir, "extensions.xml"), extensionsXml);
@@ -167,25 +167,32 @@ public class AzureDevOpsCredentialsIntegrationTest {
         return settings;
     }
 
-    private File createSettingsWithServer(String serverId) throws Exception {
-        File userSettings = new File(System.getProperty("user.home"), ".m2/settings.xml");
-        if (!userSettings.exists()) {
-            return createSettings("<settings/>");
-        }
-        String content = new String(Files.readAllBytes(userSettings.toPath()), StandardCharsets.UTF_8);
-        int serverStart = content.indexOf("<id>" + serverId + "</id>");
-        if (serverStart < 0) {
-            return createSettings("<settings/>");
-        }
-        int blockStart = content.lastIndexOf("<server>", serverStart);
-        int blockEnd = content.indexOf("</server>", serverStart) + "</server>".length();
-        String serverBlock = content.substring(blockStart, blockEnd);
-        return createSettings("<settings><servers>\n" + serverBlock + "\n</servers></settings>\n");
+    private File createSettingsWithToken(String serverId, String token) throws Exception {
+        return createSettings("<settings><servers>\n"
+                + "  <server>\n"
+                + "    <id>" + serverId + "</id>\n"
+                + "    <username>azure</username>\n"
+                + "    <password>" + token + "</password>\n"
+                + "  </server>\n"
+                + "</servers></settings>\n");
     }
 
-    private static boolean settingsHasServer(File settingsFile, String serverId) throws Exception {
-        String content = new String(Files.readAllBytes(settingsFile.toPath()), StandardCharsets.UTF_8);
-        return content.contains("<id>" + serverId + "</id>");
+    private static String getAzureCliToken() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(
+                    "az", "account", "get-access-token",
+                    "--resource", "499b84ac-1321-427f-aa17-267ca6975798",
+                    "--query", "accessToken", "-o", "tsv");
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(process.getInputStream()))) {
+                String token = reader.readLine();
+                return process.waitFor() == 0 && token != null ? token.trim() : null;
+            }
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private int runMaven(File projectDir, File settingsFile) throws Exception {
@@ -203,21 +210,29 @@ public class AzureDevOpsCredentialsIntegrationTest {
                 System.out.println(line);
             }
         }
-        return process.waitFor();
+        if (!process.waitFor(5, TimeUnit.MINUTES)) {
+            process.destroyForcibly();
+            fail("Maven process timed out after 5 minutes");
+        }
+        return process.exitValue();
+    }
+
+    private static String escapeXml(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
     }
 
     private static String repoXml(String id, String url) {
         return "    <repository>\n"
-                + "      <id>" + id + "</id>\n"
-                + "      <url>" + url + "</url>\n"
+                + "      <id>" + escapeXml(id) + "</id>\n"
+                + "      <url>" + escapeXml(url) + "</url>\n"
                 + "    </repository>\n";
     }
 
     private static String dependencyXml(String groupId, String artifactId, String version) {
         return "    <dependency>\n"
-                + "      <groupId>" + groupId + "</groupId>\n"
-                + "      <artifactId>" + artifactId + "</artifactId>\n"
-                + "      <version>" + version + "</version>\n"
+                + "      <groupId>" + escapeXml(groupId) + "</groupId>\n"
+                + "      <artifactId>" + escapeXml(artifactId) + "</artifactId>\n"
+                + "      <version>" + escapeXml(version) + "</version>\n"
                 + "    </dependency>\n";
     }
 
