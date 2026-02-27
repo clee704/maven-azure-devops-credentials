@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+trap 'rm -f "${BUNDLE:-}"' EXIT
 
 # Release script for maven-azure-devops-credentials
 # Adapted from sbt-azure-devops-credentials/release.sh
@@ -99,10 +100,10 @@ if [[ "$1" == "--finish" ]]; then
 
     info "Bumping to next snapshot version: $NEXT_VERSION"
     mvn versions:set -DnewVersion="$NEXT_VERSION" -DgenerateBackupPoms=false -q
-    sed -i "s/<version>$VERSION</<version>$NEXT_VERSION</" README.md 2>/dev/null || true
+    sed -i "s|<version>$VERSION</version><!-- release-version -->|<version>$NEXT_VERSION</version><!-- release-version -->|" README.md 2>/dev/null || true
 
     git add pom.xml README.md
-    git commit -m "chore: bump version to $NEXT_VERSION"
+    git commit -S -m "chore: bump version to $NEXT_VERSION"
 
     info "Pushing to origin"
     git push origin master --tags
@@ -173,7 +174,7 @@ sed -i "s|<version>[^<]*</version><!-- release-version -->|<version>$VERSION</ve
 # Commit and tag
 info "Committing and tagging"
 git add pom.xml README.md
-git diff --cached --quiet || git commit -m "chore: release v$VERSION"
+git diff --cached --quiet || git commit -S -m "chore: release v$VERSION"
 git tag -s "v$VERSION" -m "Release v$VERSION"
 
 # Build signed bundle
