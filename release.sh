@@ -123,7 +123,16 @@ done
 [[ -z "${VERSION:-}" ]] && { usage; exit 1; }
 validate_version "$VERSION"
 
-git tag -l | grep -q "^v$VERSION$" && error "Tag v$VERSION already exists."
+git tag -l | grep -q "^v$VERSION$" && {
+    warn "Tag v$VERSION already exists."
+    read -p "Delete it and re-release? [y/N] " -n 1 -r; echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        git tag -d "v$VERSION"
+        git push origin ":refs/tags/v$VERSION" 2>/dev/null || true
+    else
+        error "Tag v$VERSION already exists. Delete it first or use a different version."
+    fi
+}
 git diff --quiet && git diff --cached --quiet || error "Uncommitted changes. Commit or stash first."
 
 CURRENT_VERSION=$(get_current_version)
@@ -164,7 +173,7 @@ sed -i "s|<version>[^<]*</version><!-- release-version -->|<version>$VERSION</ve
 # Commit and tag
 info "Committing and tagging"
 git add pom.xml README.md
-git commit -m "chore: release v$VERSION"
+git diff --cached --quiet || git commit -m "chore: release v$VERSION"
 git tag -s "v$VERSION" -m "Release v$VERSION"
 
 # Build signed bundle
@@ -172,16 +181,20 @@ info "Building signed artifacts"
 mvn clean verify -P release -DskipTests
 
 # Create bundle zip for Sonatype Central Portal
+# Deploy to a staging directory (not local repo) to get proper checksums
+# and avoid _remote.repositories pollution
 BUNDLE="maven-azure-devops-credentials-$VERSION-bundle.zip"
-REPO_DIR="$HOME/.m2/repository/dev/chungmin/maven-azure-devops-credentials/$VERSION"
+STAGING_DIR=$(mktemp -d)
 
-info "Installing to local repo"
-mvn install -P release -DskipTests -q
+info "Deploying to staging directory"
+mvn deploy -P release -DskipTests \
+    -DaltDeploymentRepository="staging::default::file://$STAGING_DIR" -q
 
 info "Creating bundle: $BUNDLE"
-pushd "$HOME/.m2/repository" > /dev/null
+pushd "$STAGING_DIR" > /dev/null
 zip -r "$OLDPWD/$BUNDLE" "dev/chungmin/maven-azure-devops-credentials/$VERSION"
 popd > /dev/null
+rm -rf "$STAGING_DIR"
 
 # Upload to Sonatype Central Portal
 info "Uploading to Sonatype Central Portal"
