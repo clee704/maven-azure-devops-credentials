@@ -9,7 +9,7 @@ This is the Maven equivalent of [sbt-azure-devops-credentials](https://github.co
 Requirements:
 
 - Maven 3.3.1 or higher (core extensions via `.mvn/extensions.xml` require 3.3.1+).
-- Azure CLI (or any credential source supported by [DefaultAzureCredential](https://learn.microsoft.com/en-us/java/api/com.azure.identity.defaultazurecredential)).
+- Azure CLI (or any credential source supported by the extension — see [How it works](#how-it-works)).
 
 Add the following to `.mvn/extensions.xml` in your project root:
 
@@ -44,7 +44,10 @@ The extension detects Azure DevOps feed URLs (`*.pkgs.visualstudio.com` and `pkg
 ## How it works
 
 1. After Maven reads all project POMs, the extension scans repositories for Azure DevOps feed URLs.
-2. For each feed that doesn't already have credentials in `settings.xml`, it uses the [Azure Identity client library](https://github.com/Azure/azure-sdk-for-java/blob/main/sdk/identity/azure-identity/README.md) (`DefaultAzureCredential`) to acquire an access token.
+2. For each feed that doesn't already have credentials in `settings.xml`, it acquires an access token using the [Azure Identity client library](https://github.com/Azure/azure-sdk-for-java/blob/main/sdk/identity/azure-identity/README.md), trying the following credential sources in order:
+   1. **Azure CLI** (`az login`)
+   2. **Environment variables** (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`)
+   3. **Managed Identity** (for Azure VMs, App Service, etc.)
 3. Credentials are injected using Maven's own `RepositorySystem.injectAuthentication()` API, the same mechanism Maven uses internally during project building.
 
 ## Credential precedence
