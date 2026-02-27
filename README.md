@@ -78,6 +78,12 @@ Java 8 or higher is required.
 
 ## Testing
 
+Run the following once after cloning to install the pre-commit formatting hook:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 Unit tests (URL detection, organization extraction) run without Azure credentials:
 
 ```bash
@@ -93,10 +99,6 @@ export ADO_MAVEN_FEED_ID="MyFeed"
 export ADO_TEST_GROUP_ID="com.example"
 export ADO_TEST_ARTIFACT_ID="my-artifact"
 export ADO_TEST_VERSION="1.0.0"
-
-# Optional: for scenario 3 (mixed auth), provide a second feed
-export ADO_MAVEN_FEED_URL_2="https://pkgs.dev.azure.com/myorg/myproject/_packaging/OtherFeed/maven/v1"
-export ADO_MAVEN_FEED_ID_2="OtherFeed"
 
 mvn test -DincludeIntegrationTests
 ```

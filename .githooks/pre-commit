@@ -1,0 +1,2 @@
+#!/bin/sh
+mvn spotless:check --no-transfer-progress -q
