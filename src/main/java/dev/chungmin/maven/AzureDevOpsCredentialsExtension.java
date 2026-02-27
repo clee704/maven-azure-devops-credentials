@@ -38,8 +38,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.azure.core.credential.AccessToken;
+import com.azure.core.credential.TokenCredential;
 import com.azure.core.credential.TokenRequestContext;
-import com.azure.identity.DefaultAzureCredentialBuilder;
+import com.azure.identity.AzureCliCredentialBuilder;
+import com.azure.identity.ChainedTokenCredentialBuilder;
+import com.azure.identity.EnvironmentCredentialBuilder;
+import com.azure.identity.ManagedIdentityCredentialBuilder;
 
 @Named("azure-devops-credentials")
 @Singleton
@@ -85,8 +89,10 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         }
 
         // Use Maven's own RepositorySystem.injectAuthentication() to set auth on the
-        // ArtifactRepository objects, then call the setter to rebuild the Aether
-        // RemoteRepository list (which is what dependency resolution actually uses).
+        // ArtifactRepository objects. The setter call with the same list is NOT a no-op:
+        // MavenProject lazily caches the Aether RemoteRepository list, and calling the
+        // setter clears that cache, forcing it to be rebuilt from the newly-authenticated
+        // legacy ArtifactRepository objects.
         for (MavenProject project : session.getProjects()) {
             repositorySystem.injectAuthentication(
                     project.getRemoteArtifactRepositories(), newServers);
@@ -101,6 +107,9 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
 
     private void collectAzureDevOpsRepoIds(
             List<Repository> repositories, Settings settings, Set<String> repoIds) {
+        if (repositories == null) {
+            return;
+        }
         for (Repository repo : repositories) {
             if (settings.getServer(repo.getId()) != null) {
                 log.debug("Repository '{}' already has credentials in settings.xml, skipping.",
@@ -134,18 +143,20 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         log.debug("Acquiring Azure Entra access token for Azure DevOps...");
         try {
             TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
-            AccessToken token = new DefaultAzureCredentialBuilder()
-                    .build()
-                    .getToken(request)
-                    .block();
+            TokenCredential credential = new ChainedTokenCredentialBuilder()
+                    .addLast(new AzureCliCredentialBuilder().build())
+                    .addLast(new EnvironmentCredentialBuilder().build())
+                    .addLast(new ManagedIdentityCredentialBuilder().build())
+                    .build();
+            AccessToken token = credential.getToken(request).block();
             if (token != null) {
                 log.debug("Azure Entra access token acquired successfully.");
                 return token.getToken();
             } else {
-                log.warn("DefaultAzureCredential.getToken() returned null.");
+                log.warn("Token acquisition returned null.");
                 return null;
             }
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
             log.warn("Failed to acquire Azure access token. Did you forget to run 'az login'?");
             log.debug("Token acquisition error: {}", e.toString());
             return null;
