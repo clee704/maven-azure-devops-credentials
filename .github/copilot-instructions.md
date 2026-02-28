@@ -64,8 +64,6 @@ mvn test -DincludeIntegrationTests  # integration tests (requires Azure credenti
 - Use [Conventional Commits](https://www.conventionalcommits.org/) — see `CONTRIBUTING.md` for
   types and examples.
 - All commits **must be GPG-signed**: `git commit -S`
-- The GPG key is tied to `chungmin@chungminlee.com`. The global git config uses a different
-  email, so always override: `GIT_COMMITTER_EMAIL="chungmin@chungminlee.com" git -c user.email=chungmin@chungminlee.com commit -S`
 
 ## Code style
 
