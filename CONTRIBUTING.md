@@ -30,6 +30,12 @@ export ADO_TEST_VERSION="1.0.0"
 mvn test -DincludeIntegrationTests
 ```
 
+The integration tests cover three scenarios:
+
+1. **Azure CLI only** — no `settings.xml`, all auth via Entra tokens.
+2. **settings.xml only** — credentials pre-configured, extension is a no-op.
+3. **Mixed** — some repos in `settings.xml`, others authenticated via Entra.
+
 ## Code style
 
 Java source is formatted with [google-java-format](https://github.com/google/google-java-format)

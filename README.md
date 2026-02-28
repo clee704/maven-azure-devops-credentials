@@ -76,39 +76,6 @@ Java 8 or higher is required.
 - Only supports Azure DevOps Services (cloud). Azure DevOps Server (on-premises) is not supported, as it uses custom domains that cannot be auto-detected.
 - Tokens are acquired once per Maven invocation and not refreshed. This is fine for typical builds but may be an issue for builds lasting over an hour.
 
-## Testing
-
-Run the following once after cloning to install the pre-commit formatting hook:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-Unit tests (URL detection, organization extraction) run without Azure credentials:
-
-```bash
-mvn test
-```
-
-Integration tests require Azure CLI authentication, access to Azure DevOps feeds, and environment variables pointing to a test artifact:
-
-```bash
-az login
-export ADO_MAVEN_FEED_URL="https://pkgs.dev.azure.com/myorg/myproject/_packaging/MyFeed/maven/v1"
-export ADO_MAVEN_FEED_ID="MyFeed"
-export ADO_TEST_GROUP_ID="com.example"
-export ADO_TEST_ARTIFACT_ID="my-artifact"
-export ADO_TEST_VERSION="1.0.0"
-
-mvn test -DincludeIntegrationTests
-```
-
-The integration tests cover three scenarios:
-
-1. **Azure CLI only** — no `settings.xml`, all auth via Entra tokens.
-2. **settings.xml only** — credentials pre-configured, extension is a no-op.
-3. **Mixed** — some repos in `settings.xml`, others authenticated via Entra.
-
 ## Troubleshooting
 
 Enable debug logging to see what the extension is doing:
