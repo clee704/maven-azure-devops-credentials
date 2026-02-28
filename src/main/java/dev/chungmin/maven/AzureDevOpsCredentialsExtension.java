@@ -131,16 +131,19 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     }
   }
 
+  TokenCredential createCredential() {
+    return new ChainedTokenCredentialBuilder()
+        .addLast(new AzureCliCredentialBuilder().build())
+        .addLast(new EnvironmentCredentialBuilder().build())
+        .addLast(new ManagedIdentityCredentialBuilder().build())
+        .build();
+  }
+
   private String getAccessToken() {
     log.debug("Acquiring Azure Entra access token for Azure DevOps...");
     try {
       TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
-      TokenCredential credential =
-          new ChainedTokenCredentialBuilder()
-              .addLast(new AzureCliCredentialBuilder().build())
-              .addLast(new EnvironmentCredentialBuilder().build())
-              .addLast(new ManagedIdentityCredentialBuilder().build())
-              .build();
+      TokenCredential credential = createCredential();
       AccessToken token = credential.getToken(request).block();
       if (token != null) {
         log.debug("Azure Entra access token acquired successfully.");

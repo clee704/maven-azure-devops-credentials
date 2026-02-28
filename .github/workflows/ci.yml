@@ -19,4 +19,4 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java }}
           cache: maven
-      - run: mvn test spotless:check --batch-mode --no-transfer-progress
+      - run: mvn verify --batch-mode --no-transfer-progress
