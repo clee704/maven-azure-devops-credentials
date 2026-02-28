@@ -20,3 +20,35 @@ jobs:
           java-version: ${{ matrix.java }}
           cache: maven
       - run: mvn verify --batch-mode --no-transfer-progress
+      - name: Coverage summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import xml.etree.ElementTree as ET, re, os
+          report = 'target/site/jacoco/jacoco.xml'
+          if not os.path.exists(report):
+              exit(0)
+          with open(report) as f:
+              xml = re.sub(r'<!DOCTYPE[^>]*>', '', f.read())
+          root = ET.fromstring(xml)
+          counters = {c.get('type'): c for c in root.findall('counter')}
+          def pct(c):
+              covered, missed = int(c.get('covered', 0)), int(c.get('missed', 0))
+              total = covered + missed
+              return f"{100*covered//total if total else 0}% ({covered}/{total})"
+          rows = '\n'.join(
+              f'| {t.capitalize()} | {pct(counters[t])} |'
+              for t in ['INSTRUCTION', 'BRANCH', 'LINE', 'METHOD']
+              if t in counters
+          )
+          summary = f"## Coverage (Java ${{ matrix.java }})\n| Metric | Coverage |\n|---|---|\n{rows}\n"
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(summary)
+          EOF
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report-java-${{ matrix.java }}
+          path: target/site/jacoco/
+          if-no-files-found: ignore
