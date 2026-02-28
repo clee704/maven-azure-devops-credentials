@@ -7,6 +7,17 @@ on:
     branches: [master]
 
 jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+      - run: mvn spotless:check --batch-mode --no-transfer-progress
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -19,7 +30,7 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java }}
           cache: maven
-      - run: mvn verify --batch-mode --no-transfer-progress
+      - run: mvn verify -Dspotless.check.skip=true --batch-mode --no-transfer-progress
       - name: Coverage summary
         if: always()
         run: |
