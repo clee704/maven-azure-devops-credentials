@@ -30,7 +30,7 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java }}
           cache: maven
-      - run: mvn verify -Dspotless.check.skip=true --batch-mode --no-transfer-progress
+      - run: mvn verify --batch-mode --no-transfer-progress
       - name: Coverage summary
         if: always()
         run: |
