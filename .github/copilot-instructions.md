@@ -52,6 +52,7 @@ failures. Catching `Exception` would also swallow checked exceptions that should
 ## Build and test commands
 
 ```bash
+# JDK 21+ required (google-java-format 1.25.2 needs Java 21)
 mvn test                    # unit tests + spotless:check (fast)
 mvn verify                  # full check: tests + coverage gate (required before merging)
 mvn spotless:apply          # auto-fix formatting

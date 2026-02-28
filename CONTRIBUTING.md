@@ -2,7 +2,7 @@
 
 ## Development setup
 
-Requirements: JDK 8+, Maven 3.8+, Azure CLI (`az`).
+Requirements: JDK 21+, Maven 3.8+, Azure CLI (`az`).
 
 ```bash
 git clone https://github.com/clee704/maven-azure-devops-credentials.git
