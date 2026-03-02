@@ -27,6 +27,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import org.apache.maven.MavenExecutionException;
+import org.apache.maven.artifact.repository.ArtifactRepository;
+import org.apache.maven.execution.MavenExecutionRequest;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.model.Repository;
 import org.apache.maven.project.MavenProject;
@@ -47,6 +49,7 @@ public class AzureDevOpsCredentialsExtensionTest {
   @Mock private MavenProject project;
   @Mock private RepositorySystem repositorySystem;
   @Mock private TokenCredential mockCredential;
+  @Mock private MavenExecutionRequest request;
 
   private Settings settings;
   private AzureDevOpsCredentialsExtension extension;
@@ -58,6 +61,9 @@ public class AzureDevOpsCredentialsExtensionTest {
     when(session.getProjects()).thenReturn(Arrays.asList(project));
     when(project.getRepositories()).thenReturn(Collections.emptyList());
     when(project.getPluginRepositories()).thenReturn(Collections.emptyList());
+    when(session.getRequest()).thenReturn(request);
+    when(request.getRemoteRepositories()).thenReturn(Collections.emptyList());
+    when(request.getPluginArtifactRepositories()).thenReturn(Collections.emptyList());
     extension = extensionWith(mockCredential);
   }
 
@@ -234,6 +240,107 @@ public class AzureDevOpsCredentialsExtensionTest {
     verify(mockCredential, never()).getToken(any());
   }
 
+  // === afterSessionStart ===
+
+  @Test
+  public void afterSessionStart_noAzureDevOpsRepos_doesNotAcquireToken()
+      throws MavenExecutionException {
+    extension.afterSessionStart(session);
+
+    verify(mockCredential, never()).getToken(any());
+    verifyNoInteractions(repositorySystem);
+  }
+
+  @Test
+  public void afterSessionStart_nonAzureDevOpsUrl_doesNotAcquireToken()
+      throws MavenExecutionException {
+    ArtifactRepository central = artifactRepo("central", "https://repo.maven.apache.org/maven2");
+    when(request.getRemoteRepositories()).thenReturn(Arrays.asList(central));
+
+    extension.afterSessionStart(session);
+
+    verify(mockCredential, never()).getToken(any());
+  }
+
+  @Test
+  public void afterSessionStart_repoAlreadyInSettings_skipsRepo() throws MavenExecutionException {
+    settings.addServer(server("MyFeed", "user", "existing-pat"));
+    ArtifactRepository myFeed = adoArtifactRepo("MyFeed");
+    when(request.getRemoteRepositories()).thenReturn(Arrays.asList(myFeed));
+
+    extension.afterSessionStart(session);
+
+    verify(mockCredential, never()).getToken(any());
+    assertEquals("existing-pat", settings.getServer("MyFeed").getPassword());
+  }
+
+  @Test
+  public void afterSessionStart_azureDevOpsRepo_injectsCredentials()
+      throws MavenExecutionException {
+    ArtifactRepository myFeed = adoArtifactRepo("MyFeed");
+    when(request.getRemoteRepositories()).thenReturn(Arrays.asList(myFeed));
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("session-token", OffsetDateTime.now().plusHours(1))));
+
+    extension.afterSessionStart(session);
+
+    Server s = settings.getServer("MyFeed");
+    assertNotNull(s);
+    assertEquals("azure", s.getUsername());
+    assertEquals("session-token", s.getPassword());
+    verify(repositorySystem, times(2)).injectAuthentication(anyList(), anyList());
+  }
+
+  @Test
+  public void afterSessionStart_pluginRepository_injectsCredentials()
+      throws MavenExecutionException {
+    ArtifactRepository pluginFeed = adoArtifactRepo("PluginFeed");
+    when(request.getPluginArtifactRepositories()).thenReturn(Arrays.asList(pluginFeed));
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("plugin-token", OffsetDateTime.now().plusHours(1))));
+
+    extension.afterSessionStart(session);
+
+    assertEquals("plugin-token", settings.getServer("PluginFeed").getPassword());
+  }
+
+  @Test
+  public void afterSessionStart_nullToken_doesNotInjectCredentials()
+      throws MavenExecutionException {
+    ArtifactRepository myFeed = adoArtifactRepo("MyFeed");
+    when(request.getRemoteRepositories()).thenReturn(Arrays.asList(myFeed));
+    when(mockCredential.getToken(any())).thenReturn(Mono.empty());
+
+    extension.afterSessionStart(session);
+
+    assertNull(settings.getServer("MyFeed"));
+    verifyNoInteractions(repositorySystem);
+  }
+
+  @Test
+  public void afterSessionStart_credentialException_doesNotInjectCredentials()
+      throws MavenExecutionException {
+    ArtifactRepository myFeed = adoArtifactRepo("MyFeed");
+    when(request.getRemoteRepositories()).thenReturn(Arrays.asList(myFeed));
+    when(mockCredential.getToken(any())).thenThrow(new RuntimeException("auth failed"));
+
+    extension.afterSessionStart(session);
+
+    assertNull(settings.getServer("MyFeed"));
+    verifyNoInteractions(repositorySystem);
+  }
+
+  @Test
+  public void afterSessionStart_nullRepositories_handlesGracefully()
+      throws MavenExecutionException {
+    when(request.getRemoteRepositories()).thenReturn(null);
+    when(request.getPluginArtifactRepositories()).thenReturn(null);
+
+    extension.afterSessionStart(session);
+
+    verify(mockCredential, never()).getToken(any());
+  }
+
   // === helpers ===
 
   private AzureDevOpsCredentialsExtension extensionWith(TokenCredential credential)
@@ -268,5 +375,16 @@ public class AzureDevOpsCredentialsExtensionTest {
     s.setUsername(username);
     s.setPassword(password);
     return s;
+  }
+
+  private ArtifactRepository adoArtifactRepo(String id) {
+    return artifactRepo(id, "https://pkgs.dev.azure.com/org/proj/_packaging/" + id + "/maven/v1");
+  }
+
+  private ArtifactRepository artifactRepo(String id, String url) {
+    ArtifactRepository repo = mock(ArtifactRepository.class);
+    doReturn(id).when(repo).getId();
+    doReturn(url).when(repo).getUrl();
+    return repo;
   }
 }

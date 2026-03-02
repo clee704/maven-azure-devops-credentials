@@ -33,6 +33,7 @@ import javax.inject.Named;
 import javax.inject.Singleton;
 import org.apache.maven.AbstractMavenLifecycleParticipant;
 import org.apache.maven.MavenExecutionException;
+import org.apache.maven.artifact.repository.ArtifactRepository;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.model.Repository;
 import org.apache.maven.project.MavenProject;
@@ -51,6 +52,43 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   private static final String AZURE_DEVOPS_SCOPE = "499b84ac-1321-427f-aa17-267ca6975798/.default";
 
   @Inject private RepositorySystem repositorySystem;
+
+  @Override
+  public void afterSessionStart(MavenSession session) throws MavenExecutionException {
+    Settings settings = session.getSettings();
+    Set<String> repoIds = new LinkedHashSet<>();
+
+    collectAzureDevOpsArtifactRepoIds(
+        session.getRequest().getRemoteRepositories(), settings, repoIds);
+    collectAzureDevOpsArtifactRepoIds(
+        session.getRequest().getPluginArtifactRepositories(), settings, repoIds);
+
+    if (repoIds.isEmpty()) {
+      log.debug("No Azure DevOps Maven feeds found that need credentials.");
+      return;
+    }
+
+    String token = getAccessToken();
+    if (token == null) {
+      log.warn("Failed to acquire Azure access token. Azure DevOps feeds may not be accessible.");
+      return;
+    }
+
+    List<Server> newServers = new ArrayList<>();
+    for (String repoId : repoIds) {
+      Server server = new Server();
+      server.setId(repoId);
+      server.setUsername("azure");
+      server.setPassword(token);
+      settings.addServer(server);
+      newServers.add(server);
+      log.info("Injected Azure Entra credentials for repository '{}'.", repoId);
+    }
+
+    repositorySystem.injectAuthentication(session.getRequest().getRemoteRepositories(), newServers);
+    repositorySystem.injectAuthentication(
+        session.getRequest().getPluginArtifactRepositories(), newServers);
+  }
 
   @Override
   public void afterProjectsRead(MavenSession session) throws MavenExecutionException {
@@ -103,6 +141,24 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       return;
     }
     for (Repository repo : repositories) {
+      if (settings.getServer(repo.getId()) != null) {
+        log.debug(
+            "Repository '{}' already has credentials in settings.xml, skipping.", repo.getId());
+        continue;
+      }
+      if (isAzureDevOpsUrl(repo.getUrl())) {
+        repoIds.add(repo.getId());
+        log.debug("Found Azure DevOps feed '{}' at {}.", repo.getId(), repo.getUrl());
+      }
+    }
+  }
+
+  private void collectAzureDevOpsArtifactRepoIds(
+      List<ArtifactRepository> repositories, Settings settings, Set<String> repoIds) {
+    if (repositories == null) {
+      return;
+    }
+    for (ArtifactRepository repo : repositories) {
       if (settings.getServer(repo.getId()) != null) {
         log.debug(
             "Repository '{}' already has credentials in settings.xml, skipping.", repo.getId());
