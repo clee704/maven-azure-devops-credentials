@@ -6,7 +6,7 @@
 
   <groupId>dev.chungmin</groupId>
   <artifactId>maven-azure-devops-credentials</artifactId>
-  <version>0.0.3</version>
+  <version>0.0.4</version>
   <packaging>jar</packaging>
 
   <name>Maven Azure DevOps Credentials Extension</name>
