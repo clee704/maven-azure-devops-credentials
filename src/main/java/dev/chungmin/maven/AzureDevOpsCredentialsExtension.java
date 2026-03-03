@@ -33,13 +33,17 @@ import javax.inject.Named;
 import javax.inject.Singleton;
 import org.apache.maven.AbstractMavenLifecycleParticipant;
 import org.apache.maven.MavenExecutionException;
-import org.apache.maven.artifact.repository.ArtifactRepository;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.model.Repository;
 import org.apache.maven.project.MavenProject;
 import org.apache.maven.repository.RepositorySystem;
 import org.apache.maven.settings.Server;
 import org.apache.maven.settings.Settings;
+import org.eclipse.aether.DefaultRepositorySystemSession;
+import org.eclipse.aether.repository.Authentication;
+import org.eclipse.aether.repository.AuthenticationSelector;
+import org.eclipse.aether.repository.RemoteRepository;
+import org.eclipse.aether.util.repository.AuthenticationBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,39 +59,10 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
 
   @Override
   public void afterSessionStart(MavenSession session) throws MavenExecutionException {
-    Settings settings = session.getSettings();
-    Set<String> repoIds = new LinkedHashSet<>();
-
-    collectAzureDevOpsArtifactRepoIds(
-        session.getRequest().getRemoteRepositories(), settings, repoIds);
-    collectAzureDevOpsArtifactRepoIds(
-        session.getRequest().getPluginArtifactRepositories(), settings, repoIds);
-
-    if (repoIds.isEmpty()) {
-      log.debug("No Azure DevOps Maven feeds found that need credentials.");
-      return;
-    }
-
-    String token = getAccessToken();
-    if (token == null) {
-      log.warn("Failed to acquire Azure access token. Azure DevOps feeds may not be accessible.");
-      return;
-    }
-
-    List<Server> newServers = new ArrayList<>();
-    for (String repoId : repoIds) {
-      Server server = new Server();
-      server.setId(repoId);
-      server.setUsername("azure");
-      server.setPassword(token);
-      settings.addServer(server);
-      newServers.add(server);
-      log.info("Injected Azure Entra credentials for repository '{}'.", repoId);
-    }
-
-    repositorySystem.injectAuthentication(session.getRequest().getRemoteRepositories(), newServers);
-    repositorySystem.injectAuthentication(
-        session.getRequest().getPluginArtifactRepositories(), newServers);
+    DefaultRepositorySystemSession repoSession =
+        (DefaultRepositorySystemSession) session.getRepositorySession();
+    AuthenticationSelector delegate = repoSession.getAuthenticationSelector();
+    repoSession.setAuthenticationSelector(new AzureDevOpsAuthSelector(delegate));
   }
 
   @Override
@@ -153,21 +128,34 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     }
   }
 
-  private void collectAzureDevOpsArtifactRepoIds(
-      List<ArtifactRepository> repositories, Settings settings, Set<String> repoIds) {
-    if (repositories == null) {
-      return;
+  private class AzureDevOpsAuthSelector implements AuthenticationSelector {
+    private final AuthenticationSelector delegate;
+    private String cachedToken;
+    private boolean tokenAttempted;
+
+    AzureDevOpsAuthSelector(AuthenticationSelector delegate) {
+      this.delegate = delegate;
     }
-    for (ArtifactRepository repo : repositories) {
-      if (settings.getServer(repo.getId()) != null) {
-        log.debug(
-            "Repository '{}' already has credentials in settings.xml, skipping.", repo.getId());
-        continue;
+
+    @Override
+    public Authentication getAuthentication(RemoteRepository repository) {
+      if (delegate != null) {
+        Authentication existing = delegate.getAuthentication(repository);
+        if (existing != null) {
+          return existing;
+        }
       }
-      if (isAzureDevOpsUrl(repo.getUrl())) {
-        repoIds.add(repo.getId());
-        log.debug("Found Azure DevOps feed '{}' at {}.", repo.getId(), repo.getUrl());
+      if (!isAzureDevOpsUrl(repository.getUrl())) {
+        return null;
       }
+      if (!tokenAttempted) {
+        cachedToken = getAccessToken();
+        tokenAttempted = true;
+      }
+      if (cachedToken == null) {
+        return null;
+      }
+      return new AuthenticationBuilder().addUsername("azure").addPassword(cachedToken).build();
     }
   }
 

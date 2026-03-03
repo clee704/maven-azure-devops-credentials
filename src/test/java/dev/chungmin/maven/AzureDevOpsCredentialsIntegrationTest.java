@@ -47,6 +47,13 @@ public class AzureDevOpsCredentialsIntegrationTest {
   //   ADO_TEST_GROUP_ID   - groupId of a test artifact in the feed
   //   ADO_TEST_ARTIFACT_ID - artifactId of a test artifact in the feed
   //   ADO_TEST_VERSION    - version of the test artifact
+  //
+  // For parent POM resolution tests (scenario 4):
+  //   ADO_PARENT_FEED_URL - URL of an Azure DevOps Maven feed with a parent POM
+  //   ADO_PARENT_FEED_ID  - repository ID for the parent POM feed
+  //   ADO_PARENT_GROUP_ID - groupId of the parent POM artifact
+  //   ADO_PARENT_ARTIFACT_ID - artifactId of the parent POM artifact
+  //   ADO_PARENT_VERSION  - version of the parent POM artifact
 
   @Rule public TemporaryFolder tempFolder = new TemporaryFolder();
 
@@ -143,6 +150,38 @@ public class AzureDevOpsCredentialsIntegrationTest {
     assertEquals("Scenario 3 (mixed) should succeed", 0, exitCode);
   }
 
+  /**
+   * Scenario 4: A parent POM is hosted in an Azure DevOps feed declared via a settings.xml profile.
+   * The afterSessionStart hook installs an AuthenticationSelector that provides credentials at the
+   * Aether transport layer, enabling parent POM resolution before afterProjectsRead fires.
+   */
+  @Test
+  public void scenario4_parentPomFromProfileRepo() throws Exception {
+    String parentFeedUrl = System.getenv("ADO_PARENT_FEED_URL");
+    String parentFeedId = System.getenv("ADO_PARENT_FEED_ID");
+    String parentGroupId = System.getenv("ADO_PARENT_GROUP_ID");
+    String parentArtifactId = System.getenv("ADO_PARENT_ARTIFACT_ID");
+    String parentVersion = System.getenv("ADO_PARENT_VERSION");
+    assumeTrue("ADO_PARENT_FEED_URL not set", parentFeedUrl != null);
+    assumeTrue("ADO_PARENT_FEED_ID not set", parentFeedId != null);
+    assumeTrue("ADO_PARENT_GROUP_ID not set", parentGroupId != null);
+    assumeTrue("ADO_PARENT_ARTIFACT_ID not set", parentArtifactId != null);
+    assumeTrue("ADO_PARENT_VERSION not set", parentVersion != null);
+
+    File projectDir =
+        createParentPomProject(
+            "scenario4",
+            parentGroupId,
+            parentArtifactId,
+            parentVersion,
+            parentFeedId,
+            parentFeedUrl);
+    File settings = createSettingsWithProfile(parentFeedId, parentFeedUrl);
+
+    int exitCode = runMaven(projectDir, settings);
+    assertEquals("Scenario 4 (parent POM via afterSessionStart) should succeed", 0, exitCode);
+  }
+
   private File createTestProject(String name, String reposXml, String depsXml) throws Exception {
     File projectDir = tempFolder.newFolder(name);
     String pom =
@@ -159,6 +198,52 @@ public class AzureDevOpsCredentialsIntegrationTest {
             + "  <dependencies>\n"
             + depsXml
             + "  </dependencies>\n"
+            + "</project>\n";
+    writeFile(new File(projectDir, "pom.xml"), pom);
+
+    File mvnDir = new File(projectDir, ".mvn");
+    mvnDir.mkdirs();
+    String extensionsXml =
+        "<extensions xmlns=\"http://maven.apache.org/EXTENSIONS/1.0.0\">\n"
+            + "  <extension>\n"
+            + "    <groupId>dev.chungmin</groupId>\n"
+            + "    <artifactId>maven-azure-devops-credentials</artifactId>\n"
+            + "    <version>"
+            + projectVersion
+            + "</version>\n"
+            + "  </extension>\n"
+            + "</extensions>\n";
+    writeFile(new File(mvnDir, "extensions.xml"), extensionsXml);
+
+    return projectDir;
+  }
+
+  private File createParentPomProject(
+      String name,
+      String parentGroupId,
+      String parentArtifactId,
+      String parentVersion,
+      String feedId,
+      String feedUrl)
+      throws Exception {
+    File projectDir = tempFolder.newFolder(name);
+    String pom =
+        "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n"
+            + "  <modelVersion>4.0.0</modelVersion>\n"
+            + "  <parent>\n"
+            + "    <groupId>"
+            + escapeXml(parentGroupId)
+            + "</groupId>\n"
+            + "    <artifactId>"
+            + escapeXml(parentArtifactId)
+            + "</artifactId>\n"
+            + "    <version>"
+            + escapeXml(parentVersion)
+            + "</version>\n"
+            + "  </parent>\n"
+            + "  <artifactId>"
+            + name
+            + "</artifactId>\n"
             + "</project>\n";
     writeFile(new File(projectDir, "pom.xml"), pom);
 
@@ -198,6 +283,30 @@ public class AzureDevOpsCredentialsIntegrationTest {
             + "</password>\n"
             + "  </server>\n"
             + "</servers></settings>\n");
+  }
+
+  private File createSettingsWithProfile(String repoId, String repoUrl) throws Exception {
+    return createSettings(
+        "<settings>\n"
+            + "  <profiles>\n"
+            + "    <profile>\n"
+            + "      <id>ado-feed</id>\n"
+            + "      <repositories>\n"
+            + "        <repository>\n"
+            + "          <id>"
+            + escapeXml(repoId)
+            + "</id>\n"
+            + "          <url>"
+            + escapeXml(repoUrl)
+            + "</url>\n"
+            + "        </repository>\n"
+            + "      </repositories>\n"
+            + "    </profile>\n"
+            + "  </profiles>\n"
+            + "  <activeProfiles>\n"
+            + "    <activeProfile>ado-feed</activeProfile>\n"
+            + "  </activeProfiles>\n"
+            + "</settings>\n");
   }
 
   private static String getAzureCliToken() {
