@@ -121,11 +121,56 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
             "Repository '{}' already has credentials in settings.xml, skipping.", repo.getId());
         continue;
       }
+      if (isMirroredWithCredentials(repo.getId(), settings)) {
+        log.debug(
+            "Repository '{}' is covered by a mirror with credentials, skipping.", repo.getId());
+        continue;
+      }
       if (isAzureDevOpsUrl(repo.getUrl())) {
         repoIds.add(repo.getId());
         log.debug("Found Azure DevOps feed '{}' at {}.", repo.getId(), repo.getUrl());
       }
     }
+  }
+
+  /**
+   * Check if a repository is covered by a mirror that already has credentials. This prevents the
+   * extension from injecting credentials that would override the mirror's working authentication.
+   */
+  private boolean isMirroredWithCredentials(String repoId, Settings settings) {
+    for (org.apache.maven.settings.Mirror mirror : settings.getMirrors()) {
+      if (settings.getServer(mirror.getId()) == null) {
+        continue;
+      }
+      if (matchesMirrorOf(repoId, mirror.getMirrorOf())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Check if a repository ID matches a mirrorOf pattern. Supports: exact match, "*", "external:*",
+   * comma-separated lists, and "!" exclusions (e.g., "external:*,!SynapseMaven").
+   */
+  static boolean matchesMirrorOf(String repoId, String mirrorOf) {
+    if (mirrorOf == null) {
+      return false;
+    }
+    boolean matched = false;
+    for (String part : mirrorOf.split(",")) {
+      String p = part.trim();
+      if (p.isEmpty()) {
+        continue;
+      }
+      if (p.equals("!" + repoId)) {
+        return false;
+      }
+      if (p.equals("*") || p.equals("external:*") || p.equals(repoId)) {
+        matched = true;
+      }
+    }
+    return matched;
   }
 
   private class AzureDevOpsAuthSelector implements AuthenticationSelector {

@@ -134,6 +134,72 @@ public class AzureDevOpsCredentialsExtensionTest {
     assertFalse(AzureDevOpsCredentialsExtension.isAzureDevOpsUrl("https:nohost"));
   }
 
+  // === matchesMirrorOf ===
+
+  @Test
+  public void testMatchesMirrorOf_exactMatch() {
+    assertTrue(AzureDevOpsCredentialsExtension.matchesMirrorOf("MyFeed", "MyFeed"));
+  }
+
+  @Test
+  public void testMatchesMirrorOf_wildcard() {
+    assertTrue(AzureDevOpsCredentialsExtension.matchesMirrorOf("MyFeed", "*"));
+  }
+
+  @Test
+  public void testMatchesMirrorOf_externalWildcard() {
+    assertTrue(AzureDevOpsCredentialsExtension.matchesMirrorOf("MyFeed", "external:*"));
+  }
+
+  @Test
+  public void testMatchesMirrorOf_wildcardWithExclusion() {
+    assertTrue(
+        AzureDevOpsCredentialsExtension.matchesMirrorOf(
+            "A365_PublicPackages", "external:*,!SynapseMaven"));
+  }
+
+  @Test
+  public void testMatchesMirrorOf_excluded() {
+    assertFalse(
+        AzureDevOpsCredentialsExtension.matchesMirrorOf(
+            "SynapseMaven", "external:*,!SynapseMaven"));
+  }
+
+  @Test
+  public void testMatchesMirrorOf_noMatch() {
+    assertFalse(AzureDevOpsCredentialsExtension.matchesMirrorOf("MyFeed", "OtherFeed"));
+  }
+
+  @Test
+  public void testMatchesMirrorOf_null() {
+    assertFalse(AzureDevOpsCredentialsExtension.matchesMirrorOf("MyFeed", null));
+  }
+
+  @Test
+  public void testMatchesMirrorOf_commaList() {
+    assertTrue(AzureDevOpsCredentialsExtension.matchesMirrorOf("B", "A,B,C"));
+    assertFalse(AzureDevOpsCredentialsExtension.matchesMirrorOf("D", "A,B,C"));
+  }
+
+  @Test
+  public void testMatchesMirrorOf_emptyPart() {
+    // Double comma creates an empty part between A and B
+    assertTrue(AzureDevOpsCredentialsExtension.matchesMirrorOf("B", "A,,B"));
+  }
+
+  @Test
+  public void afterSessionStart_selectorWithNullDelegate() throws MavenExecutionException {
+    // Default repoSession has no auth selector (null delegate)
+    repoSession.setAuthenticationSelector(null);
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
+
+    extension.afterSessionStart(session);
+
+    AuthenticationSelector selector = repoSession.getAuthenticationSelector();
+    assertNotNull(selector.getAuthentication(adoRemoteRepo("MyFeed")));
+  }
+
   // === createCredential ===
 
   @Test
@@ -173,6 +239,71 @@ public class AzureDevOpsCredentialsExtensionTest {
 
     verify(mockCredential, never()).getToken(any());
     assertEquals("existing-pat", settings.getServer("MyFeed").getPassword());
+  }
+
+  @Test
+  public void afterProjectsRead_repoCoveredByMirrorWithCredentials_skipsRepo()
+      throws MavenExecutionException {
+    // Mirror "central" covers external:*,!SynapseMaven and has credentials
+    org.apache.maven.settings.Mirror mirror = new org.apache.maven.settings.Mirror();
+    mirror.setId("central");
+    mirror.setMirrorOf("external:*,!SynapseMaven");
+    mirror.setUrl("https://pkgs.dev.azure.com/org/proj/_packaging/Public/maven/v1");
+    settings.addMirror(mirror);
+    settings.addServer(server("central", "user", "mirror-pat"));
+
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("A365_PublicPackages")));
+
+    extension.afterProjectsRead(session);
+
+    // Should skip because the mirror covers this repo and has credentials
+    verify(mockCredential, never()).getToken(any());
+    assertNull(settings.getServer("A365_PublicPackages"));
+  }
+
+  @Test
+  public void afterProjectsRead_repoCoveredByMirrorWithoutCredentials_injectsCredentials()
+      throws MavenExecutionException {
+    // Mirror covers the repo but has no credentials — extension should still inject
+    org.apache.maven.settings.Mirror mirror = new org.apache.maven.settings.Mirror();
+    mirror.setId("central");
+    mirror.setMirrorOf("external:*");
+    mirror.setUrl("https://pkgs.dev.azure.com/org/proj/_packaging/Public/maven/v1");
+    settings.addMirror(mirror);
+    // No server entry for "central"
+
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(project.getRemoteArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(project.getPluginArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
+
+    extension.afterProjectsRead(session);
+
+    assertNotNull(settings.getServer("MyFeed"));
+  }
+
+  @Test
+  public void afterProjectsRead_repoExcludedFromMirror_injectsCredentials()
+      throws MavenExecutionException {
+    // Mirror covers external:* but excludes SynapseMaven
+    org.apache.maven.settings.Mirror mirror = new org.apache.maven.settings.Mirror();
+    mirror.setId("central");
+    mirror.setMirrorOf("external:*,!SynapseMaven");
+    mirror.setUrl("https://pkgs.dev.azure.com/org/proj/_packaging/Public/maven/v1");
+    settings.addMirror(mirror);
+    settings.addServer(server("central", "user", "mirror-pat"));
+
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("SynapseMaven")));
+    when(project.getRemoteArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(project.getPluginArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
+
+    extension.afterProjectsRead(session);
+
+    // SynapseMaven is excluded from mirror, so extension should inject
+    assertNotNull(settings.getServer("SynapseMaven"));
   }
 
   @Test
