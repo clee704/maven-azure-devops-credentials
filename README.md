@@ -20,7 +20,7 @@ Add the following to `.mvn/extensions.xml` in your project root:
   <extension>
     <groupId>dev.chungmin</groupId>
     <artifactId>maven-azure-devops-credentials</artifactId>
-    <version>0.0.5</version><!-- release-version -->
+    <version>0.0.6</version><!-- release-version -->
   </extension>
 </extensions>
 ```
