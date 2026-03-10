@@ -100,9 +100,8 @@ if [[ "$1" == "--finish" ]]; then
 
     info "Bumping to next snapshot version: $NEXT_VERSION"
     mvn versions:set -DnewVersion="$NEXT_VERSION" -DgenerateBackupPoms=false -q
-    sed -i "s|<version>$VERSION</version><!-- release-version -->|<version>$NEXT_VERSION</version><!-- release-version -->|" README.md 2>/dev/null || true
 
-    git add pom.xml README.md
+    git add pom.xml
     git commit -S -m "chore: bump version to $NEXT_VERSION"
 
     info "Pushing to origin"
