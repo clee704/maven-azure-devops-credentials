@@ -363,6 +363,25 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
+  public void afterProjectsRead_restoresLogLevelProperty() throws MavenExecutionException {
+    String prop = "org.slf4j.simpleLogger.log.com.azure.identity";
+    System.setProperty(prop, "debug");
+    try {
+      when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+      when(mockCredential.getToken(any()))
+          .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
+      when(project.getRemoteArtifactRepositories()).thenReturn(new ArrayList<>());
+      when(project.getPluginArtifactRepositories()).thenReturn(new ArrayList<>());
+
+      extension.afterProjectsRead(session);
+
+      assertEquals("debug", System.getProperty(prop));
+    } finally {
+      System.clearProperty(prop);
+    }
+  }
+
+  @Test
   public void afterProjectsRead_nullRepositories_handlesGracefully()
       throws MavenExecutionException {
     when(project.getRepositories()).thenReturn(null);

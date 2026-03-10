@@ -55,6 +55,13 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
 
   private static final String AZURE_DEVOPS_SCOPE = "499b84ac-1321-427f-aa17-267ca6975798/.default";
 
+  // Maven's SLF4J SimpleLogger uses system properties to control per-logger log levels.
+  // We suppress com.azure.identity logging during token acquisition to prevent Azure Identity's
+  // expected [ERROR] messages (from ChainedTokenCredential trying each provider) from going to
+  // stdout and corrupting output captured by tools like CMake.
+  private static final String AZURE_IDENTITY_LOG_PROPERTY =
+      "org.slf4j.simpleLogger.log.com.azure.identity";
+
   @Inject private RepositorySystem repositorySystem;
 
   @Override
@@ -230,6 +237,14 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
 
   private String getAccessToken() {
     log.debug("Acquiring Azure Entra access token for Azure DevOps...");
+    // Suppress Azure Identity logging during token acquisition. The ChainedTokenCredential
+    // tries multiple credential providers in sequence (Azure CLI, Environment, Managed Identity)
+    // and logs [ERROR] for each provider that fails. These are expected failures — not all
+    // providers are available in all environments. In Maven, SLF4J routes to System.out, so
+    // these errors can pollute stdout and break tools that capture Maven's stdout output
+    // (e.g., CMake's execute_process with mvn help:evaluate -DforceStdout).
+    String previousLevel = System.getProperty(AZURE_IDENTITY_LOG_PROPERTY);
+    System.setProperty(AZURE_IDENTITY_LOG_PROPERTY, "off");
     try {
       TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
       TokenCredential credential = createCredential();
@@ -245,6 +260,12 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       log.warn("Failed to acquire Azure access token. Did you forget to run 'az login'?");
       log.debug("Token acquisition error: {}", e.toString());
       return null;
+    } finally {
+      if (previousLevel != null) {
+        System.setProperty(AZURE_IDENTITY_LOG_PROPERTY, previousLevel);
+      } else {
+        System.clearProperty(AZURE_IDENTITY_LOG_PROPERTY);
+      }
     }
   }
 }
