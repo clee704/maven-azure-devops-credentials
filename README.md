@@ -74,7 +74,7 @@ Java 8 or higher is required.
 ## Limitations
 
 - Only supports Azure DevOps Services (cloud). Azure DevOps Server (on-premises) is not supported, as it uses custom domains that cannot be auto-detected.
-- Tokens are acquired once per Maven invocation and not refreshed. This is fine for typical builds but may be an issue for builds lasting over an hour.
+- Tokens are acquired once per Maven invocation and not refreshed. This matches Maven's own behavior for credentials in `settings.xml`, which are also read once at startup, so the extension imposes no additional limit over a static `settings.xml`. Builds whose token-using HTTP requests outlive a single Azure Entra access token (~1 hour from issue) will fail regardless of credential source; truly mid-invocation refresh would require a custom Aether `Authentication` with per-request `fill()`.
 
 ## Troubleshooting
 
