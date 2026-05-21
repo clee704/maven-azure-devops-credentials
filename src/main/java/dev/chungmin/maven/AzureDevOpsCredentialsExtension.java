@@ -104,7 +104,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // is invoked on every HTTP request by HttpTransporter.commonHeaders(), so each request gets
     // a fresh bearer token from Azure Identity — which internally caches and refreshes the token
     // ~5 minutes before expiry. This eliminates the per-invocation token-staleness window that
-    // bites builds longer than the token's lifetime (~70 minutes for Entra access tokens).
+    // bites builds longer than the token's lifetime (~60-75 minutes for Entra access tokens).
     DefaultRepositorySystemSession repoSession =
         (DefaultRepositorySystemSession) session.getRepositorySession();
     TokenCredential sharedCredential = createCredential();
@@ -118,12 +118,14 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // Also do an eager one-shot token acquisition for legacy/fallback paths:
     //   - the Settings.Server entries below (used by Maven Wagon and other non-Aether
     //     transports that ignore aether.connector.http.headers.* config)
-    //   - the AzureDevOpsAuthSelector installed in afterSessionStart, which is what serves
-    //     auth to Aether transports that pre-date HTTP_HEADERS support
+    //   - the AzureDevOpsAuthSelector installed in afterSessionStart, which surfaces a Basic
+    //     Authorization header via Aether's AuthenticationSelector API. When HTTP_HEADERS is
+    //     also set the explicit Bearer header wins; this is a harmless duplicate, but useful
+    //     for transports that ignore the HTTP_HEADERS config.
     // The HTTP_HEADERS live Map above takes precedence for modern Aether HTTP transport and is
     // what makes long builds work; this static token only covers the legacy edges and is NOT
     // refreshed mid-build.
-    String token = getAccessToken();
+    String token = getAccessToken(sharedCredential);
     if (token == null) {
       log.warn(
           "Failed to acquire initial Azure access token. Live header refresh will retry per request, "
@@ -208,8 +210,8 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     } catch (ReflectiveOperationException e) {
       log.error(
           "Could not install live Authorization header for '{}'; mid-build token refresh is"
-              + " disabled and `mvn` invocations longer than the Entra token TTL (~75 minutes)"
-              + " will fail with HTTP 401. Cause: {}",
+              + " disabled and `mvn` invocations longer than the Entra token TTL"
+              + " (~60-75 minutes) will fail with HTTP 401. Cause: {}",
           key,
           e.toString());
     }
@@ -276,7 +278,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         return null;
       }
       if (!tokenAttempted) {
-        cachedToken = getAccessToken();
+        cachedToken = getAccessToken(createCredential());
         tokenAttempted = true;
       }
       if (cachedToken == null) {
@@ -294,9 +296,9 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
    * from Azure Identity (which caches the token internally and refreshes ~5 minutes before expiry).
    * This allows a single Maven invocation to keep authenticating against an Azure DevOps Maven feed
    * indefinitely, even past the original token's expiry — which would otherwise break builds longer
-   * than the token lifetime (~70 minutes for Entra access tokens).
+   * than the token lifetime (~60-75 minutes for Entra access tokens).
    */
-  class LiveBearerHeadersMap extends AbstractMap<String, String> {
+  static class LiveBearerHeadersMap extends AbstractMap<String, String> {
     private final TokenCredential credential;
 
     LiveBearerHeadersMap(TokenCredential credential) {
@@ -351,11 +353,10 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         .build();
   }
 
-  private String getAccessToken() {
+  private String getAccessToken(TokenCredential credential) {
     log.debug("Acquiring Azure Entra access token for Azure DevOps...");
     try {
       TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
-      TokenCredential credential = createCredential();
       AccessToken token = credential.getToken(request).block();
       if (token != null) {
         log.debug("Azure Entra access token acquired successfully.");

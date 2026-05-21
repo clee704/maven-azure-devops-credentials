@@ -492,7 +492,7 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenReturn(Mono.just(new AccessToken("token-A", OffsetDateTime.now().plusHours(1))));
 
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        extension.new LiveBearerHeadersMap(mockCredential);
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
 
     assertEquals(1, map.entrySet().size());
     java.util.Map.Entry<String, String> entry = map.entrySet().iterator().next();
@@ -510,7 +510,7 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenReturn(Mono.just(new AccessToken("token-3", OffsetDateTime.now().plusHours(1))));
 
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        extension.new LiveBearerHeadersMap(mockCredential);
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
 
     assertEquals("Bearer token-1", map.entrySet().iterator().next().getValue());
     assertEquals("Bearer token-2", map.entrySet().iterator().next().getValue());
@@ -523,7 +523,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     when(mockCredential.getToken(any())).thenReturn(Mono.empty());
 
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        extension.new LiveBearerHeadersMap(mockCredential);
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
 
     assertTrue(map.entrySet().isEmpty());
   }
@@ -533,7 +533,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     when(mockCredential.getToken(any())).thenThrow(new RuntimeException("auth failed"));
 
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        extension.new LiveBearerHeadersMap(mockCredential);
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
 
     assertTrue(map.entrySet().isEmpty());
   }
