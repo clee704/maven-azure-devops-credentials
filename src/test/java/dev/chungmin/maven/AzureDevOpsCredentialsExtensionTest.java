@@ -639,14 +639,18 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenThrow(new RuntimeException("auth failed"))
         .thenThrow(new RuntimeException("auth failed"))
         .thenThrow(new RuntimeException("auth failed"));
+    org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential, mockLog);
     // All three calls return empty (no header).
     assertTrue(map.entrySet().isEmpty());
     assertTrue(map.entrySet().isEmpty());
     assertTrue(map.entrySet().isEmpty());
     // The credential was still consulted on each call; the rate-limit is on logging only.
     verify(mockCredential, times(3)).getToken(any());
+    // Exactly ONE warn for the entire sustained-failure run.
+    verify(mockLog, times(1)).warn(anyString(), anyString(), any(Throwable.class));
+    verify(mockLog, never()).warn(anyString(), anyString());
   }
 
   @Test
@@ -655,12 +659,17 @@ public class AzureDevOpsCredentialsExtensionTest {
     // must treat this the same as the exception path (the resulting 401 has the same blast
     // radius).
     when(mockCredential.getToken(any())).thenReturn(Mono.empty());
+    org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential, mockLog);
     assertTrue(map.entrySet().isEmpty());
     assertTrue(map.entrySet().isEmpty());
     assertTrue(map.entrySet().isEmpty());
     verify(mockCredential, times(3)).getToken(any());
+    // Null-token path does NOT carry a Throwable cause; warn fires once with the (msg, arg)
+    // overload only.
+    verify(mockLog, times(1)).warn(anyString(), anyString());
+    verify(mockLog, never()).warn(anyString(), anyString(), any(Throwable.class));
   }
 
   @Test
@@ -670,12 +679,28 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenThrow(new RuntimeException("fail-1"))
         .thenReturn(Mono.just(new AccessToken("recovered", OffsetDateTime.now().plusHours(1))))
         .thenThrow(new RuntimeException("fail-2"));
+    org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential, mockLog);
     assertTrue(map.entrySet().isEmpty());
     assertEquals("Bearer recovered", map.entrySet().iterator().next().getValue());
     assertTrue(map.entrySet().isEmpty());
     verify(mockCredential, times(3)).getToken(any());
+    // TWO warns total: one per fail-1 -> success transition gap.
+    verify(mockLog, times(2)).warn(anyString(), anyString(), any(Throwable.class));
+  }
+
+  @Test
+  public void liveBearerHeadersMap_toStringDoesNotLeakBearerToken() {
+    // Override AbstractMap.toString(): the default iterates entrySet() (-> credential call
+    // + Bearer JWT in the string). A regression that removed our override would expose
+    // bearer tokens via any framework logger that dumps the headers map.
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+    String s = map.toString();
+    assertFalse("toString must not contain a Bearer token", s.contains("Bearer"));
+    assertFalse("toString must not invoke the credential", s.contains("Authorization"));
+    verify(mockCredential, never()).getToken(any());
   }
 
   @Test

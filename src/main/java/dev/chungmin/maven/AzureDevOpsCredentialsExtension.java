@@ -76,7 +76,10 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   // a single TokenCredential means all paths hit the same internal Azure SDK cache, so the
   // first hit triggers one chain walk and every subsequent caller — including mid-build
   // refreshes — gets the cached, transparently-renewed token.
-  private volatile TokenCredential sharedCredential;
+  // Single sharedCredential init under a synchronized accessor; the synchronized block
+  // provides the necessary happens-before for every subsequent read, so the field doesn't
+  // also need to be volatile (synchronized + volatile is a noisy half-DCL pattern).
+  private TokenCredential sharedCredential;
 
   synchronized TokenCredential getSharedCredential() {
     if (sharedCredential == null) {
@@ -211,7 +214,6 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
    * HashMap} directly via reflection — the {@code Collections.unmodifiableMap} view that Aether
    * exposes is a live view over the same map, so consumers see the new entry.
    */
-  @SuppressWarnings("unchecked")
   static void installSessionConfig(
       DefaultRepositorySystemSession repoSession, String key, Object value) {
     installSessionConfig(repoSession, key, value, DefaultRepositorySystemSession.class);
@@ -355,6 +357,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
    */
   static class LiveBearerHeadersMap extends AbstractMap<String, String> {
     private final TokenCredential credential;
+    private final org.slf4j.Logger logger;
     // Rate-limits the per-request failure warning: {@code entrySet()} is called on EVERY
     // outbound HTTP request, so a sustained credential outage during a 1000-artifact resolve
     // would otherwise drown the log in 1000 identical warnings before the user sees the 401.
@@ -362,7 +365,15 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     private final AtomicBoolean inFailureState = new AtomicBoolean(false);
 
     LiveBearerHeadersMap(TokenCredential credential) {
+      this(credential, log);
+    }
+
+    // Logger-injection overload exists so unit tests can verify the warn rate-limiter without
+    // pulling in an SLF4J test appender dependency. Production callers always use the
+    // single-arg constructor.
+    LiveBearerHeadersMap(TokenCredential credential, org.slf4j.Logger logger) {
       this.credential = credential;
+      this.logger = logger;
     }
 
     @Override
@@ -377,6 +388,16 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
           new AbstractMap.SimpleImmutableEntry<>("Authorization", "Bearer " + token));
     }
 
+    // AbstractMap.toString() iterates entrySet() and formats each entry, which would (a) trigger
+    // a synchronous credential.getToken().block() and (b) print the live Bearer JWT to whatever
+    // logged/printed the map (e.g., Maven -X debug output, a future framework that dumps
+    // session config, or an exception toString() that quotes its arguments). Return a fixed
+    // token-free label instead.
+    @Override
+    public String toString() {
+      return "AzureDevOpsLiveAuthHeaders";
+    }
+
     private String acquireToken() {
       try {
         TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
@@ -384,23 +405,34 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         if (token == null) {
           // Mono.empty() — SDK returned no token without throwing. Same failure mode as the
           // catch path (request will 401), so go through the same rate-limited warn helper.
-          noteFailure("Azure credential returned no token (Mono.empty())");
+          noteFailure("Azure credential returned no token (Mono.empty())", null);
           return null;
         }
         inFailureState.set(false);
         return token.getToken();
       } catch (RuntimeException e) {
-        noteFailure("Failed to refresh Azure access token mid-build: " + e);
+        noteFailure("Failed to refresh Azure access token mid-build", e);
         return null;
       }
     }
 
-    private void noteFailure(String reason) {
+    private void noteFailure(String reason, Throwable cause) {
       if (inFailureState.compareAndSet(false, true)) {
-        log.warn(
-            "{}. Request will go out unauthenticated; subsequent failures will be suppressed"
-                + " until the next successful refresh.",
-            reason);
+        // Pass the cause as the trailing argument so SLF4J formats with parameterized
+        // placeholders (lazy concat) AND preserves the stacktrace when a logging backend
+        // is bound that prints it.
+        if (cause == null) {
+          logger.warn(
+              "{}. Request will go out unauthenticated; subsequent failures will be suppressed"
+                  + " until the next successful refresh.",
+              reason);
+        } else {
+          logger.warn(
+              "{}. Request will go out unauthenticated; subsequent failures will be suppressed"
+                  + " until the next successful refresh.",
+              reason,
+              cause);
+        }
       }
     }
   }
