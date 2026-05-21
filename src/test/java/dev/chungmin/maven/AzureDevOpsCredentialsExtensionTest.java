@@ -59,7 +59,7 @@ public class AzureDevOpsCredentialsExtensionTest {
 
   @Before
   public void setUp() throws Exception {
-    AzureDevOpsCredentialsExtension.resetFailureGatesForTest();
+    AzureDevOpsCredentialsExtension.resetFailureGates();
     settings = new Settings();
     repoSession = new DefaultRepositorySystemSession();
     when(session.getSettings()).thenReturn(settings);
@@ -505,21 +505,110 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
-  public void liveBearerHeadersMap_refreshesOnEachEntrySetCall() {
-    // This is the core property: HttpTransporter.commonHeaders() iterates entrySet() on every
-    // outgoing request, and we MUST return the current token each time, not a baked one.
+  public void liveBearerHeadersMap_returnsCurrentTokenFromEachEntrySetCall() {
+    // Core property: HttpTransporter.commonHeaders() iterates entrySet() on every outgoing
+    // request, and we MUST return the CURRENT bearer token each time, not one baked at
+    // constructor time. After M1's local cache (~tenth-review fix), "current" means "the
+    // latest token the cache has seen" — sequential same-cache-window calls return the
+    // cached value; expiry-window crossing triggers a refresh.
     when(mockCredential.getToken(any()))
-        .thenReturn(Mono.just(new AccessToken("token-1", OffsetDateTime.now().plusHours(1))))
-        .thenReturn(Mono.just(new AccessToken("token-2", OffsetDateTime.now().plusHours(1))))
-        .thenReturn(Mono.just(new AccessToken("token-3", OffsetDateTime.now().plusHours(1))));
+        .thenReturn(Mono.just(new AccessToken("token-1", OffsetDateTime.now().plusHours(1))));
 
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
         new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
 
+    // First call populates cache; subsequent calls within the TTL hit the cache.
     assertEquals("Bearer token-1", map.entrySet().iterator().next().getValue());
-    assertEquals("Bearer token-2", map.entrySet().iterator().next().getValue());
-    assertEquals("Bearer token-3", map.entrySet().iterator().next().getValue());
-    verify(mockCredential, times(3)).getToken(any());
+    assertEquals("Bearer token-1", map.entrySet().iterator().next().getValue());
+    assertEquals("Bearer token-1", map.entrySet().iterator().next().getValue());
+    // Aether ALWAYS sees the current token via entrySet(); the cache short-circuits the
+    // SDK call but does NOT short-circuit the entrySet() callback contract.
+  }
+
+  @Test
+  public void liveBearerHeadersMap_cachesAccessTokenWithinTTL() {
+    // M1: AzureCliCredential has no built-in cache; without our local cache every Aether
+    // HTTP request would fork `az account get-access-token`. This test pins the cache hit
+    // behavior: 3 sequential calls with a long-TTL token result in exactly ONE getToken().
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("token-1", OffsetDateTime.now().plusHours(1))));
+
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+
+    map.entrySet().iterator().next().getValue();
+    map.entrySet().iterator().next().getValue();
+    map.entrySet().iterator().next().getValue();
+    verify(mockCredential, times(1)).getToken(any());
+  }
+
+  @Test
+  public void liveBearerHeadersMap_refreshesAccessTokenWhenWithinExpiryWindow() {
+    // M1 refresh boundary: a cached token within 5 min of expiry is treated as stale and
+    // triggers a fresh fetch on the next acquire. Set up the first token at expiry+2min
+    // (stale on second check) and the second at expiry+1h (fresh).
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("near-expiry", OffsetDateTime.now().plusMinutes(2))))
+        .thenReturn(Mono.just(new AccessToken("fresh-token", OffsetDateTime.now().plusHours(1))))
+        .thenReturn(Mono.just(new AccessToken("fresh-token-2", OffsetDateTime.now().plusHours(1))));
+
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+
+    // First call: cache empty, fetch near-expiry, cache it, return it.
+    assertEquals("Bearer near-expiry", map.entrySet().iterator().next().getValue());
+    // Second call: cache has near-expiry token, isNearExpiry returns true, refetch.
+    assertEquals("Bearer fresh-token", map.entrySet().iterator().next().getValue());
+    // Third call: cache has fresh-token (1h expiry), isNearExpiry returns false, cache hit.
+    assertEquals("Bearer fresh-token", map.entrySet().iterator().next().getValue());
+    verify(mockCredential, times(2)).getToken(any());
+  }
+
+  @Test
+  public void liveBearerHeadersMap_refreshesAccessTokenWhenExpiryIsNull() {
+    // Defensive: an SDK that returns AccessToken with a null expiresAt — we can't trust the
+    // cached value across requests (no basis to know freshness), so treat null-expiry as
+    // always-stale and refetch every time.
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("no-expiry-1", null)))
+        .thenReturn(Mono.just(new AccessToken("no-expiry-2", null)));
+
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+
+    assertEquals("Bearer no-expiry-1", map.entrySet().iterator().next().getValue());
+    assertEquals("Bearer no-expiry-2", map.entrySet().iterator().next().getValue());
+    verify(mockCredential, times(2)).getToken(any());
+  }
+
+  @Test
+  public void liveBearerHeadersMap_cacheIsSharedAcrossInstances() {
+    // afterProjectsRead creates one sharedCachedToken AtomicReference and passes it to every
+    // per-repo LiveBearerHeadersMap. A workspace with N ADO feeds + 1 fetched token should
+    // result in 1 getToken() call total, not N (one per feed).
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("shared", OffsetDateTime.now().plusHours(1))));
+    java.util.concurrent.atomic.AtomicReference<AccessToken> sharedCache =
+        new java.util.concurrent.atomic.AtomicReference<>();
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap feedA =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(
+            mockCredential,
+            mock(org.slf4j.Logger.class),
+            new java.util.concurrent.atomic.AtomicBoolean(false),
+            new java.util.concurrent.atomic.AtomicReference<>(),
+            sharedCache);
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap feedB =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(
+            mockCredential,
+            mock(org.slf4j.Logger.class),
+            new java.util.concurrent.atomic.AtomicBoolean(false),
+            new java.util.concurrent.atomic.AtomicReference<>(),
+            sharedCache);
+
+    assertEquals("Bearer shared", feedA.entrySet().iterator().next().getValue());
+    assertEquals("Bearer shared", feedB.entrySet().iterator().next().getValue());
+    // feedB's first call hit the cache populated by feedA → only one SDK round-trip.
+    verify(mockCredential, times(1)).getToken(any());
   }
 
   @Test
@@ -684,9 +773,14 @@ public class AzureDevOpsCredentialsExtensionTest {
   @Test
   public void liveBearerHeadersMap_rewarnAfterRecovery() {
     // Failure, then success (state reset), then failure again -> should warn twice total.
+    // M1 caveat: the success in the middle returns a NEAR-EXPIRY token; without that, the
+    // cache would short-circuit the third call and skip the SDK round-trip entirely, and the
+    // second warn would never fire because the failure path isn't reached. Near-expiry
+    // (2-min remaining) is treated as stale by isNearExpiry, so the third call re-enters the
+    // slow path and re-exercises the failure handler.
     when(mockCredential.getToken(any()))
         .thenThrow(new RuntimeException("fail-1"))
-        .thenReturn(Mono.just(new AccessToken("recovered", OffsetDateTime.now().plusHours(1))))
+        .thenReturn(Mono.just(new AccessToken("recovered", OffsetDateTime.now().plusMinutes(2))))
         .thenThrow(new RuntimeException("fail-2"));
     org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
@@ -761,6 +855,26 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
+  public void installSessionConfig_skipsWorkAfterPriorReflectionFailureInSameBuild() {
+    // L3: once the reflectionFailureLogged gate has tripped (a prior repo's reflective
+    // install failed), every subsequent installSessionConfig call should early-return —
+    // both the wasted setConfigProperty IllegalStateException and the wasted
+    // getDeclaredField failure are avoided. Verifies the gate-check at the top of the
+    // 4-arg overload.
+    DefaultRepositorySystemSession failingSession = new DefaultRepositorySystemSession();
+    failingSession.setReadOnly();
+    // First call: trip the gate.
+    AzureDevOpsCredentialsExtension.installSessionConfig(failingSession, "k", "v", Object.class);
+    // Second call: now hits the early-return at the top — won't even attempt setConfigProperty,
+    // which means a WRITABLE session WOULDN'T get the value installed either.
+    DefaultRepositorySystemSession writableSession = new DefaultRepositorySystemSession();
+    AzureDevOpsCredentialsExtension.installSessionConfig(writableSession, "k2", "v2");
+    assertFalse(
+        "Second call should early-return after prior reflective failure tripped the gate",
+        writableSession.getConfigProperties().containsKey("k2"));
+  }
+
+  @Test
   public void liveBearerHeadersMap_singleFlightCoalescesConcurrentAcquisitions() throws Exception {
     // H2: under burst load (mvn -T 1C resolver pool, every thread hitting entrySet() in the
     // same window), AzureCliCredential has NO built-in cache and would otherwise fork one `az`
@@ -824,13 +938,14 @@ public class AzureDevOpsCredentialsExtensionTest {
           workersReady.await(5, java.util.concurrent.TimeUnit.SECONDS));
       // Release all 8 threads to race into acquireToken() simultaneously.
       startLatch.countDown();
-      // Wait for the leader to reach getToken() and block inside the answer.
+      // Wait for the leader to reach getToken() and block inside the answer. After CAS the
+      // leader's future is visible in inFlightToken; the remaining 7 workers will each
+      // observe it on their first peek and join() it. No need for a wall-clock settle —
+      // there's no time-bounded path that could let a waiter become a second leader while
+      // the original leader is parked in the answer.
       assertTrue(
           "Leader thread should reach getToken() within 5s",
           firstCallReached.await(5, java.util.concurrent.TimeUnit.SECONDS));
-      // Hold the leader for a full second so the remaining 7 waiters arrive at the
-      // in-flight future before it gets completed and cleared.
-      Thread.sleep(1000);
       // Release the leader.
       releaseFirstCall.countDown();
       // All N threads should return the same Bearer value.
@@ -852,10 +967,12 @@ public class AzureDevOpsCredentialsExtensionTest {
   @Test
   public void liveBearerHeadersMap_singleFlightStartsFreshAfterPriorCompletion() {
     // Single-flight intentionally clears the in-flight reference immediately after each
-    // acquisition completes, so the NEXT call kicks off a fresh fetch (we don't replicate
-    // the SDK's cache). Sequential calls should each trigger their own getToken().
+    // acquisition completes, so the NEXT call kicks off a fresh fetch when needed. M1's
+    // local cache short-circuits sequential calls within the token's TTL, so this test
+    // uses a near-expiry first token to force the second call back into the slow path
+    // and re-exercise the single-flight cleanup.
     when(mockCredential.getToken(any()))
-        .thenReturn(Mono.just(new AccessToken("t1", OffsetDateTime.now().plusHours(1))))
+        .thenReturn(Mono.just(new AccessToken("t1", OffsetDateTime.now().plusMinutes(2))))
         .thenReturn(Mono.just(new AccessToken("t2", OffsetDateTime.now().plusHours(1))));
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
         new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
@@ -953,10 +1070,8 @@ public class AzureDevOpsCredentialsExtensionTest {
   public void liveBearerHeadersMap_leaderErrorCompletesFutureExceptionallyAndPropagates() {
     // The leader's catch (Error) branch must completeExceptionally(error) BEFORE rethrowing
     // — otherwise waiters joined on the in-flight future would hang forever. Single-threaded
-    // test exercises the catch-Error + finally-clear path; the concurrent-visibility guarantee
-    // is covered structurally by completeExceptionally being called before the rethrow (and
-    // tested separately via singleFlightPropagatesErrorFromPriorLeader, which exercises the
-    // waiter-side joinUnwrapped path with a pre-completed future).
+    // test exercises the catch-Error + finally-clear path on the leader side; the concurrent
+    // waiter visibility is covered by leaderErrorPropagatesToConcurrentWaiters below.
     when(mockCredential.getToken(any()))
         .thenAnswer(
             invocation -> {
@@ -970,6 +1085,79 @@ public class AzureDevOpsCredentialsExtensionTest {
       fail("Error from leader should propagate, not be swallowed");
     } catch (Error e) {
       assertEquals("leader-jvm-error", e.getMessage());
+    }
+  }
+
+  @Test
+  public void liveBearerHeadersMap_leaderErrorPropagatesToConcurrentWaiters() throws Exception {
+    // L2: regression catcher for a future refactor that drops `myFuture.completeExceptionally
+    // (e)` from the leader's catch (Error) block. Without that call, the 7 waiters joined on
+    // the leader's in-flight future would hang on future.join() FOREVER instead of seeing the
+    // leader's Error. The 5-second per-thread timeout below is the regression catcher.
+    int threadCount = 8;
+    java.util.concurrent.CountDownLatch workersReady =
+        new java.util.concurrent.CountDownLatch(threadCount);
+    java.util.concurrent.CountDownLatch startLatch = new java.util.concurrent.CountDownLatch(1);
+    java.util.concurrent.CountDownLatch leaderInGetToken =
+        new java.util.concurrent.CountDownLatch(1);
+    java.util.concurrent.CountDownLatch releaseLeader = new java.util.concurrent.CountDownLatch(1);
+
+    when(mockCredential.getToken(any()))
+        .thenAnswer(
+            invocation -> {
+              leaderInGetToken.countDown();
+              releaseLeader.await();
+              throw new Error("leader-jvm-error");
+            });
+
+    java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<AccessToken>>
+        sharedInFlight = new java.util.concurrent.atomic.AtomicReference<>();
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(
+            mockCredential,
+            mock(org.slf4j.Logger.class),
+            new java.util.concurrent.atomic.AtomicBoolean(false),
+            sharedInFlight);
+
+    java.util.concurrent.ExecutorService pool =
+        java.util.concurrent.Executors.newFixedThreadPool(threadCount);
+    try {
+      java.util.List<java.util.concurrent.Future<Throwable>> futures = new ArrayList<>();
+      for (int i = 0; i < threadCount; i++) {
+        futures.add(
+            pool.submit(
+                () -> {
+                  workersReady.countDown();
+                  startLatch.await();
+                  try {
+                    map.entrySet();
+                    return null;
+                  } catch (Error e) {
+                    return e;
+                  }
+                }));
+      }
+      assertTrue(
+          "All " + threadCount + " workers should park within 5s",
+          workersReady.await(5, java.util.concurrent.TimeUnit.SECONDS));
+      startLatch.countDown();
+      assertTrue(
+          "Leader should reach getToken() within 5s",
+          leaderInGetToken.await(5, java.util.concurrent.TimeUnit.SECONDS));
+      // Release the leader — its answer throws Error. If completeExceptionally(Error) is
+      // correctly called from the leader's catch (Error) block, all 7 waiters unblock with
+      // the same Error within the per-thread timeout. If a regression removed it, the
+      // waiters hang and f.get(5, SECONDS) below times out.
+      releaseLeader.countDown();
+
+      for (java.util.concurrent.Future<Throwable> f : futures) {
+        Throwable t = f.get(5, java.util.concurrent.TimeUnit.SECONDS);
+        assertNotNull("Every thread should see the leader's Error, not hang", t);
+        assertTrue("Error type preserved", t instanceof Error);
+        assertEquals("leader-jvm-error", t.getMessage());
+      }
+    } finally {
+      pool.shutdown();
     }
   }
 

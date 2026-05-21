@@ -24,6 +24,7 @@ import com.azure.identity.EnvironmentCredentialBuilder;
 import com.azure.identity.ManagedIdentityCredentialBuilder;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.time.OffsetDateTime;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -114,6 +115,12 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
 
   @Override
   public void afterSessionStart(MavenSession session) throws MavenExecutionException {
+    // Per-build reset of the static gates below. In a regular `mvn` invocation this is a
+    // no-op (gates start false in a fresh JVM), but under Maven Daemon (mvnd) the extension
+    // class is loaded once and reused across many builds — without this reset, a single
+    // build's reflective-fallback failure would permanently silence every subsequent
+    // build's diagnostic logs JVM-wide.
+    resetFailureGates();
     // Suppress noisy [ERROR] messages from ChainedTokenCredential trying each credential provider
     // in turn. SLF4J SimpleLogger (Maven's default binding) reads this property when the
     // com.azure.identity logger is first created, so setting it once here covers every later
@@ -183,14 +190,22 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       // subprocess per call (no built-in cache for CLI tokens). Without this gate, a burst
       // would fork N `az` processes simultaneously; with it, the first thread fetches and the
       // rest await the same future. The reference clears immediately after each acquisition,
-      // so the NEXT burst gets a fresh fetch (we don't try to replicate the SDK's expiry
-      // tracking — that's the SDK's job for credentials that support caching).
+      // so the NEXT burst gets a fresh fetch.
       AtomicReference<CompletableFuture<AccessToken>> sharedInFlightToken = new AtomicReference<>();
+      // Share one AccessToken cache across every per-repo LiveBearerHeadersMap. AzureCliCredential
+      // shells out to `az account get-access-token` per getToken() call (no built-in cache), so
+      // without this every Aether HTTP request would fork an `az` subprocess — ~3-8 min of pure
+      // overhead on a 1000-artifact sequential resolve. The cache holds the AccessToken until
+      // 5 min before expiry, mirroring the Azure Identity SDK's own pre-expiry refresh
+      // heuristic. Sharing across feeds is correct: a single user's token works for every ADO
+      // Maven feed they have access to (the scope is the ADO resource ID, not per-feed).
+      AtomicReference<AccessToken> sharedCachedToken = new AtomicReference<>();
       for (String repoId : repoIds) {
         installSessionConfig(
             repoSession,
             ConfigurationProperties.HTTP_HEADERS + "." + repoId,
-            new LiveBearerHeadersMap(credential, log, sharedFailureState, sharedInFlightToken));
+            new LiveBearerHeadersMap(
+                credential, log, sharedFailureState, sharedInFlightToken, sharedCachedToken));
       }
     } else {
       // Defensive guard: a custom RepositorySystemSession (mvnd, a future Maven version, or
@@ -285,14 +300,16 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   // Per-JVM gates: a failure in installSessionConfig's reflective fallback (or in the
   // verifyConfigInstalled post-check) will repeat identically for every repo in a workspace's
   // afterProjectsRead loop, so we only log the first occurrence. Mirrors the same
-  // log-on-transition pattern as LiveBearerHeadersMap.inFailureState. Per-JVM is safe because
-  // the extension is @Singleton scoped within Maven's classloader.
+  // log-on-transition pattern as LiveBearerHeadersMap.inFailureState. Per-JVM is safe within
+  // a single `mvn` invocation; under Maven Daemon (mvnd) the extension class is reused across
+  // builds, so we reset the gates at afterSessionStart to keep the at-most-once-per-build
+  // contract intact.
   private static final AtomicBoolean reflectionFailureLogged = new AtomicBoolean(false);
   private static final AtomicBoolean verificationFailureLogged = new AtomicBoolean(false);
 
-  // Test-only seam: JUnit @Before reset so static gates don't bleed across tests and cause
-  // coverage gaps (the gated log.error must execute at least once per test class run).
-  static void resetFailureGatesForTest() {
+  // Per-build reset hook. Called from afterSessionStart (production: mvnd reuse) and from
+  // JUnit @Before (tests: static state must not bleed across test methods or coverage drops).
+  static void resetFailureGates() {
     reflectionFailureLogged.set(false);
     verificationFailureLogged.set(false);
   }
@@ -300,6 +317,13 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   @SuppressWarnings("unchecked")
   static void installSessionConfig(
       DefaultRepositorySystemSession repoSession, String key, Object value, Class<?> targetClass) {
+    if (reflectionFailureLogged.get()) {
+      // A prior install attempt in this build already failed the reflective fallback. Every
+      // subsequent feed would hit the same setConfigProperty IllegalStateException and the
+      // same getDeclaredField failure (the environment hasn't changed mid-build). Skip the
+      // wasted exception cycle; the first feed's log.error already informed the user.
+      return;
+    }
     try {
       repoSession.setConfigProperty(key, value);
       return;
@@ -459,21 +483,50 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // mechanics; see afterProjectsRead for the rationale (AzureCliCredential has no
     // built-in cache, so without coalescing N concurrent threads = N concurrent `az` forks).
     private final AtomicReference<CompletableFuture<AccessToken>> inFlightToken;
+    // Short-TTL token cache: shared across every per-repo instance constructed in
+    // afterProjectsRead. AzureCliCredential and a few other DefaultAzureCredentialBuilder
+    // chain members have NO built-in token cache — every getToken() call shells out to
+    // `az account get-access-token` (or the equivalent). Without this cache, a 1000-artifact
+    // sequential resolve would fork ~1000 `az` subprocesses (3-8 min of pure overhead) on
+    // top of the actual download time. With it, the first request fetches and the next
+    // ~55-70 minutes of requests hit the cache instead. The 5-minute refresh window mirrors
+    // the Azure Identity SDK's own pre-expiry refresh heuristic; tokens within that window
+    // are treated as stale and trigger a fresh fetch.
+    private final AtomicReference<AccessToken> cachedToken;
+
+    // Pre-expiry refresh window: a cached token within this many minutes of expiry is
+    // treated as stale and triggers a fresh fetch. Mirrors the Azure Identity SDK's own
+    // heuristic — 5 minutes gives the resolver headroom for a single ~30-minute build
+    // phase to never see expiry mid-flight, even if the token was already 70 minutes old
+    // when we cached it.
+    private static final long TOKEN_REFRESH_BEFORE_EXPIRY_MINUTES = 5;
 
     LiveBearerHeadersMap(TokenCredential credential) {
-      this(credential, log, new AtomicBoolean(false), new AtomicReference<>());
+      this(
+          credential,
+          log,
+          new AtomicBoolean(false),
+          new AtomicReference<>(),
+          new AtomicReference<>());
     }
 
     // Logger-injection overload exists so unit tests can verify the warn rate-limiter without
     // pulling in an SLF4J test appender dependency. Production callers always use the
-    // single-arg constructor or the four-arg variant that shares both gates.
+    // single-arg constructor or the five-arg variant that shares the warn-rate gate, the
+    // single-flight gate, and the token cache across every per-repo instance.
     LiveBearerHeadersMap(TokenCredential credential, org.slf4j.Logger logger) {
-      this(credential, logger, new AtomicBoolean(false), new AtomicReference<>());
+      this(
+          credential,
+          logger,
+          new AtomicBoolean(false),
+          new AtomicReference<>(),
+          new AtomicReference<>());
     }
 
     LiveBearerHeadersMap(
         TokenCredential credential, org.slf4j.Logger logger, AtomicBoolean sharedFailureState) {
-      this(credential, logger, sharedFailureState, new AtomicReference<>());
+      this(
+          credential, logger, sharedFailureState, new AtomicReference<>(), new AtomicReference<>());
     }
 
     LiveBearerHeadersMap(
@@ -481,10 +534,20 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         org.slf4j.Logger logger,
         AtomicBoolean sharedFailureState,
         AtomicReference<CompletableFuture<AccessToken>> sharedInFlightToken) {
+      this(credential, logger, sharedFailureState, sharedInFlightToken, new AtomicReference<>());
+    }
+
+    LiveBearerHeadersMap(
+        TokenCredential credential,
+        org.slf4j.Logger logger,
+        AtomicBoolean sharedFailureState,
+        AtomicReference<CompletableFuture<AccessToken>> sharedInFlightToken,
+        AtomicReference<AccessToken> sharedCachedToken) {
       this.credential = credential;
       this.logger = logger;
       this.inFailureState = sharedFailureState;
       this.inFlightToken = sharedInFlightToken;
+      this.cachedToken = sharedCachedToken;
     }
 
     @Override
@@ -538,6 +601,12 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     }
 
     private String acquireToken() {
+      // Fast path: a previously cached token that's still well clear of expiry.
+      AccessToken cached = cachedToken.get();
+      if (cached != null && !isNearExpiry(cached)) {
+        inFailureState.set(false);
+        return cached.getToken();
+      }
       AccessToken token;
       try {
         token = acquireTokenSingleFlight();
@@ -553,6 +622,15 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       }
       inFailureState.set(false);
       return token.getToken();
+    }
+
+    private static boolean isNearExpiry(AccessToken token) {
+      // null expiry is treated as stale — if the SDK can't tell us when it expires, we have
+      // no basis to trust the cached value across requests.
+      return token.getExpiresAt() == null
+          || token
+              .getExpiresAt()
+              .isBefore(OffsetDateTime.now().plusMinutes(TOKEN_REFRESH_BEFORE_EXPIRY_MINUTES));
     }
 
     // Single-flight via AtomicReference<CompletableFuture>: the FIRST thread into a burst
@@ -581,6 +659,14 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         if (tryClaimLeadership(myFuture)) {
           try {
             AccessToken token = blockForToken(credential);
+            if (token != null) {
+              // Populate the cache BEFORE completing the future so waiters that just joined
+              // see a populated cache on their next entry into acquireToken(); without this,
+              // the leader and waiters would all return the same token (correctly) but the
+              // NEXT request would re-enter the slow path with an empty cache, defeating the
+              // whole point of caching the freshly-acquired token.
+              cachedToken.set(token);
+            }
             myFuture.complete(token);
             return token;
           } catch (RuntimeException e) {
