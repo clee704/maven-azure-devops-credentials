@@ -973,13 +973,39 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
-  public void verifyConfigInstalled_handlesMissingAndPresent() {
-    // Mismatch path (value not visible): future Aether regression simulation.
-    AzureDevOpsCredentialsExtension.verifyConfigInstalled(
-        java.util.Collections.emptyMap(), "k3", "v3");
-    // Match path (value visible): no-op.
+  @SuppressWarnings("unchecked")
+  public void verifyConfigInstalled_logsOnMismatchOnceAndSuppressesRepeats() throws Exception {
+    // N23: previously this test invoked verifyConfigInstalled on both branches but asserted
+    // nothing — a regression that dropped the log.error or the verificationFailureLogged
+    // compareAndSet gate would have passed silently. Mirror the sibling
+    // installSessionConfig_reflectionFailure_swallowsAndLogs pattern: assert the
+    // verificationFailureLogged gate flips on the first mismatch, stays flipped on a second
+    // mismatch (rate-limit gate holds), and doesn't flip from a match call. The gate is a
+    // private static AtomicBoolean — accessed via reflection (same justification as N21's
+    // sharedCachedToken inspection; @Before's resetFailureGates() ensures clean state).
+    java.lang.reflect.Field gateField =
+        AzureDevOpsCredentialsExtension.class.getDeclaredField("verificationFailureLogged");
+    gateField.setAccessible(true);
+    java.util.concurrent.atomic.AtomicBoolean gate =
+        (java.util.concurrent.atomic.AtomicBoolean) gateField.get(null);
+    assertFalse("Pre-condition: @Before resetFailureGates left gate clear", gate.get());
+
+    // Match path (value visible): no-op — gate must stay clear.
     AzureDevOpsCredentialsExtension.verifyConfigInstalled(
         java.util.Collections.singletonMap("k3", (Object) "v3"), "k3", "v3");
+    assertFalse("Match path must not trip the gate", gate.get());
+
+    // First mismatch: gate flips (and the log.error fires; we don't intercept stderr here
+    // because the JaCoCo coverage check + the gate transition together pin the behavior).
+    AzureDevOpsCredentialsExtension.verifyConfigInstalled(
+        java.util.Collections.emptyMap(), "k3", "v3");
+    assertTrue("First mismatch must trip the rate-limit gate", gate.get());
+
+    // Second mismatch: gate stays flipped (compareAndSet(false, true) returns false, log
+    // call is skipped). A regression that removed the gate would silently re-log here.
+    AzureDevOpsCredentialsExtension.verifyConfigInstalled(
+        java.util.Collections.emptyMap(), "k4", "v4");
+    assertTrue("Gate must stay flipped on second mismatch (rate-limit invariant)", gate.get());
   }
 
   @Test
@@ -1554,6 +1580,40 @@ public class AzureDevOpsCredentialsExtensionTest {
 
     assertEquals("Bearer winner-token", map.entrySet().iterator().next().getValue());
     // Critical: we joined the winner's future instead of forking our own token request.
+    verify(mockCredential, never()).getToken(any());
+  }
+
+  @Test
+  public void liveBearerHeadersMap_singleFlightReChecksCacheAfterWinningCAS() {
+    // N24: simulate the race where a prior leader populates cachedToken between our
+    // outer fast-path read (in acquireToken) and our CAS win inside acquireTokenSingleFlight.
+    // Use the tryClaimLeadership test seam to inject the cache-population side effect at
+    // the exact moment between peek and CAS win. The N24 re-check inside the leader's try
+    // block should observe the populated cache and short-circuit the blockForToken call.
+    AccessToken priorLeaderToken =
+        new AccessToken("by-prior-leader", OffsetDateTime.now().plusHours(1));
+    java.util.concurrent.atomic.AtomicReference<AccessToken> sharedCache =
+        new java.util.concurrent.atomic.AtomicReference<>();
+
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(
+            mockCredential,
+            mock(org.slf4j.Logger.class),
+            new java.util.concurrent.atomic.AtomicBoolean(false),
+            new java.util.concurrent.atomic.AtomicReference<>(),
+            sharedCache) {
+          @Override
+          boolean tryClaimLeadership(java.util.concurrent.CompletableFuture<AccessToken> f) {
+            // Simulate a prior leader populating the cache AFTER our acquireToken
+            // fast-path missed (cache was empty at that read) but BEFORE our CAS resolves.
+            sharedCache.set(priorLeaderToken);
+            return super.tryClaimLeadership(f);
+          }
+        };
+
+    assertEquals("Bearer by-prior-leader", map.entrySet().iterator().next().getValue());
+    // N24 invariant: the cache-recheck-after-CAS branch must avoid the redundant
+    // blockForToken (i.e., for AzureCliCredential, the redundant `az` subprocess fork).
     verify(mockCredential, never()).getToken(any());
   }
 

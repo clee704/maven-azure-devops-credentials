@@ -827,6 +827,18 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         CompletableFuture<AccessToken> myFuture = new CompletableFuture<>();
         if (tryClaimLeadership(myFuture)) {
           try {
+            // N24: re-check the cache after winning the CAS. A prior leader may have
+            // populated cachedToken between our outer fast-path read (in acquireToken)
+            // and our CAS win here — e.g. boot fetch / selector slow path / a previous
+            // burst's leader all share this same cachedToken via afterProjectsRead. Using
+            // the cached value here saves a redundant blockForToken (and for
+            // AzureCliCredential, a redundant `az` subprocess fork) at the cost of one
+            // atomic load. Same N15 staleness criterion as the outer fast path.
+            AccessToken justCached = cachedToken.get();
+            if (justCached != null && !isNearExpiry(justCached)) {
+              myFuture.complete(justCached);
+              return justCached;
+            }
             AccessToken token = blockForToken(credential);
             if (token != null && token.getExpiresAt() != null) {
               // Populate the cache BEFORE completing the future so waiters that just joined
