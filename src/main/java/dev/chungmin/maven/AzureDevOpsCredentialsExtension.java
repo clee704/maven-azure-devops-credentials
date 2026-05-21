@@ -495,6 +495,13 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       // calls request.removeHeaders(key) when the value isn't a String, so the request goes out
       // WITHOUT an Authorization header at all — same wire behavior as the original "return
       // emptySet on failure" path, but now size() and entrySet().size() agree.
+      //
+      // Load-bearing assumption (verified against maven-resolver-transport-http 1.x): the
+      // commonHeaders() loop dispatches on `entry.getValue() instanceof String` — true →
+      // setHeader, false (including null) → removeHeaders. A hypothetical future Aether that
+      // switched to String.valueOf(value) would silently send `Authorization: null` and
+      // produce confusing 401s. If you're chasing a "null Authorization in wire trace" bug
+      // after a maven-resolver bump, check the value-type dispatch in commonHeaders() first.
       String value = token != null ? "Bearer " + token : null;
       return Collections.singleton(new AbstractMap.SimpleImmutableEntry<>("Authorization", value));
     }
@@ -670,7 +677,14 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         return null;
       }
     } catch (RuntimeException e) {
-      log.warn("Failed to acquire Azure access token. Did you forget to run 'az login'?");
+      // The DefaultAzureCredentialBuilder chain in createCredential() tries Azure CLI,
+      // environment variables, and Managed Identity in order. Steer the user toward the
+      // most common remediation for each (local dev → `az login`; CI / VM → check env
+      // vars or VM identity assignment) instead of assuming CLI is the only path.
+      log.warn(
+          "Failed to acquire Azure access token. Tried Azure CLI, environment variables,"
+              + " and Managed Identity — none succeeded. Try `az login` locally, or check"
+              + " `AZURE_CLIENT_ID` / Managed Identity role assignment on this host.");
       log.debug("Token acquisition error: {}", e.toString());
       return null;
     }

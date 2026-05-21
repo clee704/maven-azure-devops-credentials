@@ -769,6 +769,8 @@ public class AzureDevOpsCredentialsExtensionTest {
     // entrySet() while the credential is stalled in mid-getToken; only one fetch must complete
     // by the time all eight return.
     int threadCount = 8;
+    java.util.concurrent.CountDownLatch workersReady =
+        new java.util.concurrent.CountDownLatch(threadCount);
     java.util.concurrent.CountDownLatch startLatch = new java.util.concurrent.CountDownLatch(1);
     java.util.concurrent.CountDownLatch firstCallReached =
         new java.util.concurrent.CountDownLatch(1);
@@ -806,19 +808,27 @@ public class AzureDevOpsCredentialsExtensionTest {
         futures.add(
             pool.submit(
                 () -> {
-                  startLatch.await(); // all threads wait at the same gate
+                  // Deterministic barrier: each worker signals "I'm parked at the gate"
+                  // before awaiting the release. The main thread waits for all N workers
+                  // to signal before releasing, eliminating the wall-clock race where a
+                  // late-scheduled worker would otherwise miss the in-flight future and
+                  // become a second leader (defeating the test's purpose).
+                  workersReady.countDown();
+                  startLatch.await();
                   return map.entrySet().iterator().next().getValue();
                 }));
       }
-      // Brief settle for the thread-pool to actually schedule all workers onto the await().
-      Thread.sleep(100);
+      // All 8 workers parked at startLatch.await() — now safe to release.
+      assertTrue(
+          "All " + threadCount + " workers should park within 5s",
+          workersReady.await(5, java.util.concurrent.TimeUnit.SECONDS));
       // Release all 8 threads to race into acquireToken() simultaneously.
       startLatch.countDown();
       // Wait for the leader to reach getToken() and block inside the answer.
       assertTrue(
           "Leader thread should reach getToken() within 5s",
           firstCallReached.await(5, java.util.concurrent.TimeUnit.SECONDS));
-      // Hold the leader for a full second so even slow-to-schedule waiters arrive at the
+      // Hold the leader for a full second so the remaining 7 waiters arrive at the
       // in-flight future before it gets completed and cleared.
       Thread.sleep(1000);
       // Release the leader.
@@ -980,11 +990,14 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
-  public void afterProjectsRead_nonDefaultRepositorySession_skipsWithoutCastException()
-      throws MavenExecutionException {
-    // M1 (mirror of the afterSessionStart guard): the live-headers install path must also
-    // skip cleanly if the resolver session isn't a DefaultRepositorySystemSession. The boot
-    // settings.xml injection still runs because it doesn't touch the resolver session.
+  public void
+      afterProjectsRead_nonDefaultRepositorySession_skipsLiveHeadersButStillInjectsSettings()
+          throws MavenExecutionException {
+    // M1 (mirror of the afterSessionStart guard): the live-headers install path must skip
+    // cleanly if the resolver session isn't a DefaultRepositorySystemSession, BUT the boot
+    // Settings.Server fallback must continue to run — it doesn't touch the resolver session,
+    // so it's still safe and still covers ~60-75 minutes of build time on a non-Default
+    // session implementation.
     when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
     when(mockCredential.getToken(any()))
         .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
@@ -996,9 +1009,16 @@ public class AzureDevOpsCredentialsExtensionTest {
 
     extension.afterProjectsRead(session); // must NOT throw ClassCastException
 
-    // Boot path is unaffected — the live-map install branch returned early but settings
-    // injection didn't run because we early-return before reaching it.
+    // (a) Live-headers install was skipped — we didn't touch the custom session's config.
     verify(customSession, never()).getConfigProperties();
+    // (b) Boot Settings.Server fallback DID run — this is the load-bearing guarantee that
+    // short/medium builds keep working when the live-headers path isn't available. A future
+    // refactor that accidentally short-circuited the settings injection on non-Default
+    // sessions would defeat the whole point of the M1 cast-guard.
+    assertNotNull(
+        "Boot Settings.Server fallback must still inject on non-Default sessions",
+        settings.getServer("MyFeed"));
+    verify(repositorySystem, atLeastOnce()).injectAuthentication(anyList(), anyList());
   }
 
   // === helpers ===
