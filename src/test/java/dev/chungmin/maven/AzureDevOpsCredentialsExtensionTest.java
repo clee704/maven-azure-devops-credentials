@@ -59,6 +59,7 @@ public class AzureDevOpsCredentialsExtensionTest {
 
   @Before
   public void setUp() throws Exception {
+    AzureDevOpsCredentialsExtension.resetFailureGatesForTest();
     settings = new Settings();
     repoSession = new DefaultRepositorySystemSession();
     when(session.getSettings()).thenReturn(settings);
@@ -363,7 +364,10 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
-  public void afterProjectsRead_restoresLogLevelProperty() throws MavenExecutionException {
+  public void afterProjectsRead_doesNotTouchLogProperty() throws MavenExecutionException {
+    // The SLF4J property suppression moved from afterProjectsRead to afterSessionStart in
+    // 135a42c; this test now passively verifies that afterProjectsRead doesn't disturb a
+    // pre-set value (the property's value test for afterSessionStart lives separately).
     String prop = "org.slf4j.simpleLogger.log.com.azure.identity";
     System.setProperty(prop, "debug");
     try {
@@ -707,6 +711,24 @@ public class AzureDevOpsCredentialsExtensionTest {
     assertTrue(feedA.entrySet().isEmpty());
     // ONE warn total across both instances, not two.
     verify(mockLog, times(1)).warn(anyString(), anyString(), any(Throwable.class));
+  }
+
+  @Test
+  public void liveBearerHeadersMap_passiveIntrospectionDoesNotTriggerToken() {
+    // M1: AbstractMap defaults for size(), equals(Object), hashCode() all delegate to
+    // entrySet().iterator(). Without overrides, casual introspection (Maven -X dumping
+    // session config, an exception toString quoting its arguments, equals() comparison
+    // against another map) would (a) round-trip to Entra and (b) in the case of equals(),
+    // materialize the JWT into a String. Identity overrides eliminate both hazards.
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap other =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+    assertEquals(1, map.size());
+    assertTrue("identity: map equals itself", map.equals(map));
+    assertFalse("identity: map does not equal a peer instance", map.equals(other));
+    assertEquals(System.identityHashCode(map), map.hashCode());
+    verify(mockCredential, never()).getToken(any());
   }
 
   @Test

@@ -222,6 +222,21 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     installSessionConfig(repoSession, key, value, DefaultRepositorySystemSession.class);
   }
 
+  // Per-JVM gates: a failure in installSessionConfig's reflective fallback (or in the
+  // verifyConfigInstalled post-check) will repeat identically for every repo in a workspace's
+  // afterProjectsRead loop, so we only log the first occurrence. Mirrors the same
+  // log-on-transition pattern as LiveBearerHeadersMap.inFailureState. Per-JVM is safe because
+  // the extension is @Singleton scoped within Maven's classloader.
+  private static final AtomicBoolean reflectionFailureLogged = new AtomicBoolean(false);
+  private static final AtomicBoolean verificationFailureLogged = new AtomicBoolean(false);
+
+  // Test-only seam: JUnit @Before reset so static gates don't bleed across tests and cause
+  // coverage gaps (the gated log.error must execute at least once per test class run).
+  static void resetFailureGatesForTest() {
+    reflectionFailureLogged.set(false);
+    verificationFailureLogged.set(false);
+  }
+
   @SuppressWarnings("unchecked")
   static void installSessionConfig(
       DefaultRepositorySystemSession repoSession, String key, Object value, Class<?> targetClass) {
@@ -237,12 +252,15 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       f.setAccessible(true);
       ((java.util.Map<String, Object>) f.get(repoSession)).put(key, value);
     } catch (ReflectiveOperationException e) {
-      log.error(
-          "Could not install live Authorization header for '{}'; mid-build token refresh is"
-              + " disabled and `mvn` invocations longer than the Entra token TTL"
-              + " (~60-75 minutes) will fail with HTTP 401. Cause: {}",
-          key,
-          e.toString());
+      if (reflectionFailureLogged.compareAndSet(false, true)) {
+        log.error(
+            "Could not install live Authorization header for '{}'; mid-build token refresh is"
+                + " disabled and `mvn` invocations longer than the Entra token TTL"
+                + " (~60-75 minutes) will fail with HTTP 401. Subsequent feeds in this build"
+                + " will fail identically; suppressing further error logs. Cause: {}",
+            key,
+            e.toString());
+      }
       return;
     }
     // Defensive verification: confirm the reflective write is visible through Aether's public
@@ -258,10 +276,13 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // instance we wrote show up in the view? Using Objects.equals here would dispatch to
     // AbstractMap.equals on a mismatch, which calls size() -> entrySet() -> credential.getToken()
     // — an unwanted side effect during what is supposed to be a passive diagnostic.
-    if (configPropertiesView.get(key) != value) {
+    if (configPropertiesView.get(key) != value
+        && verificationFailureLogged.compareAndSet(false, true)) {
       log.error(
           "Reflective install of '{}' completed but value is not visible via"
-              + " getConfigProperties(); mid-build token refresh may not take effect.",
+              + " getConfigProperties(); mid-build token refresh may not take effect."
+              + " Subsequent feeds in this build will fail identically; suppressing further"
+              + " error logs.",
           key);
     }
   }
@@ -365,6 +386,13 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   static class LiveBearerHeadersMap extends AbstractMap<String, String> {
     // The scopes argument never changes and the SDK only reads from it; reuse one instance
     // across every per-request acquireToken() call to avoid the per-HTTP-request allocation.
+    //
+    // Assumption: no credential in the chain (CLI, Environment, ManagedIdentity at time of
+    // writing) mutates the request. TokenRequestContext IS mutable (addScopes / setClaims /
+    // setTenantId / setCaeEnabled), so if a future Azure Identity revision — or a new
+    // credential type added to the chain — calls those during getToken(), this shared
+    // instance would be corrupted JVM-wide. If that day arrives, switch this back to a
+    // per-call allocation (the cost is one short-lived object per HTTP request).
     private static final TokenRequestContext TOKEN_REQUEST =
         new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
 
@@ -406,6 +434,27 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       }
       return Collections.singleton(
           new AbstractMap.SimpleImmutableEntry<>("Authorization", "Bearer " + token));
+    }
+
+    // Identity semantics for size(), equals(), and hashCode() — same motivation as the
+    // toString() override below. AbstractMap's defaults all call entrySet().iterator() and,
+    // in the case of equals(), materialize the value into a String to compare it against
+    // the other map's get(key) — which means a Bearer JWT can land in arbitrary places
+    // (exception toString quoting its arguments, a framework's debug log, etc.). The map is
+    // never compared by content anywhere in Maven/Aether, so identity is correct.
+    @Override
+    public int size() {
+      return 1;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      return o == this;
+    }
+
+    @Override
+    public int hashCode() {
+      return System.identityHashCode(this);
     }
 
     // AbstractMap.toString() iterates entrySet() and formats each entry, which would (a) trigger
