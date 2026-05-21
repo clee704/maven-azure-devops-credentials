@@ -749,6 +749,33 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
+  public void liveBearerHeadersMap_doesNotPoisonCacheWithNullExpiryToken() {
+    // N15 invariant: a token with null getExpiresAt() must NOT land in the cache. Caching
+    // it would force every future request back through the slow path (isNearExpiry returns
+    // true for null expiry) AND violate the "if cachedToken is non-null, it has a usable
+    // expiry" invariant the rest of the file's null-expiry guards rely on. Use the 5-arg
+    // forTest factory so the test can inspect the externally-owned cache reference after
+    // the entrySet() call.
+    when(mockCredential.getToken(any())).thenReturn(Mono.just(new AccessToken("no-expiry", null)));
+    java.util.concurrent.atomic.AtomicReference<AccessToken> sharedCache =
+        new java.util.concurrent.atomic.AtomicReference<>();
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+            mockCredential,
+            mock(org.slf4j.Logger.class),
+            new java.util.concurrent.atomic.AtomicBoolean(false),
+            new java.util.concurrent.atomic.AtomicReference<>(),
+            sharedCache);
+
+    // Current request still gets served the token (it's the only one available).
+    assertEquals("Bearer no-expiry", map.entrySet().iterator().next().getValue());
+    // But the cache stays empty — invariant intact for the next caller.
+    assertNull(
+        "Null-expiry AccessToken must not poison the cache (it would always be stale anyway)",
+        sharedCache.get());
+  }
+
+  @Test
   public void liveBearerHeadersMap_cacheIsSharedAcrossInstances() {
     // afterProjectsRead creates one sharedCachedToken AtomicReference and passes it to every
     // per-repo LiveBearerHeadersMap. A workspace with N ADO feeds + 1 fetched token should

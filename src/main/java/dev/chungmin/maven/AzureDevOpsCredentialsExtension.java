@@ -706,17 +706,26 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       return Collections.singleton(new AbstractMap.SimpleImmutableEntry<>("Authorization", value));
     }
 
-    // Meta-pattern: every passive-introspection method on AbstractMap delegates to
-    // entrySet().iterator() (toString formats each entry; equals materializes values to
-    // compare them via .equals; hashCode sums entry hashes; size counts). For our live
-    // map this would (a) trigger a synchronous credential.getToken() — wrong for any
-    // "is this object harmless to log/inspect" caller — and (b) in equals/toString,
+    // Scoped override defense: every "implicit / passive-introspection" method on
+    // AbstractMap — toString, equals, hashCode, size — delegates to entrySet().iterator(),
+    // which for our live map would (a) trigger a synchronous credential.getToken() (wrong
+    // for any "is this object harmless to log/inspect" caller) and (b) in equals/toString,
     // materialize a Bearer JWT into a String that lands wherever the caller is dumping
     // (Maven -X debug, a future framework that toString'd its config, an exception that
-    // quotes its arguments). The map is never compared by content or sized anywhere in
-    // Maven/Aether (commonHeaders() only iterates entrySet()), so identity / fixed-string
-    // semantics are correct and defuse the whole class of "accidental token exposure
-    // via Object method" hazards in one place.
+    // quotes its arguments). The four overrides below return identity / fixed-string
+    // semantics so these "I didn't ask for the value" callers see nothing sensitive.
+    //
+    // Explicitly NOT overridden: get(Object), containsKey(Object), containsValue(Object),
+    // keySet(), values(). These are explicit Map-API calls — a caller invoking them HAS
+    // asked for the value, so the inherited AbstractMap defaults (which DO route through
+    // entrySet()) are intentional: they'll trigger the fetch and return the real Bearer
+    // string. Overriding them to identity/empty would either lie (Map contract violation:
+    // get returns null while entrySet has the entry) or force a content-vs-key
+    // inconsistency (size=1 but values=emptyList). Aether's HttpTransporter.commonHeaders()
+    // only iterates entrySet() today, so neither inherited path is hot in production; if a
+    // future Aether bump or a custom extension starts calling get()/values()/keySet() on
+    // this map, the AbstractMap defaults will Do The Right Thing — return the live token —
+    // because the caller asked for it.
     @Override
     public int size() {
       return 1;
@@ -819,12 +828,21 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         if (tryClaimLeadership(myFuture)) {
           try {
             AccessToken token = blockForToken(credential);
-            if (token != null) {
+            if (token != null && token.getExpiresAt() != null) {
               // Populate the cache BEFORE completing the future so waiters that just joined
               // see a populated cache on their next entry into acquireToken(); without this,
               // the leader and waiters would all return the same token (correctly) but the
               // NEXT request would re-enter the slow path with an empty cache, defeating the
               // whole point of caching the freshly-acquired token.
+              //
+              // N15 guard: skip the cache.set when getExpiresAt() is null. isNearExpiry()
+              // and cachedTokenIfStillRealValid() both treat null-expiry as always-stale, so
+              // caching such a token would force every subsequent request back through this
+              // slow path anyway (defeating M1) AND leave a useless entry in the cache that
+              // violates the "if cachedToken is non-null, it has a usable expiry" invariant
+              // the rest of the file's null-expiry guards quietly rely on. The current
+              // request still gets served the token; the next one re-fetches from a clean
+              // (null) cache, which has the same wire cost but a sane invariant.
               cachedToken.set(token);
             }
             myFuture.complete(token);
@@ -959,14 +977,24 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     try {
       token = blockForToken(credential);
     } catch (RuntimeException e) {
-      log.debug("Token acquisition error: {}", e.toString());
+      // N20: passing `e` as the trailing arg attaches the stack trace via SLF4J's
+      // parameterized API (last arg is treated as Throwable when there are more args than
+      // placeholders). Without it, users debugging "tokens stopped working" who enable -X
+      // get only the e.toString() — no JDK frame pointing at the actual Azure SDK / network
+      // / process-spawn failure inside blockForToken. Matches the shape N11 introduced for
+      // installSessionConfig and N9 confirmed for LiveBearerHeadersMap.noteFailure.
+      log.debug("Token acquisition error: {}", e.toString(), e);
       return useFallbackOrWarnUnauthenticated(cacheRef);
     }
     if (token == null) {
       return useFallbackOrWarnUnauthenticated(cacheRef);
     }
     log.debug("Azure Entra access token acquired successfully.");
-    if (cacheRef != null) {
+    if (cacheRef != null && token.getExpiresAt() != null) {
+      // N15 guard, mirrored from the live-path leader: don't poison the cache with a
+      // null-expiry AccessToken — both isNearExpiry() and cachedTokenIfStillRealValid()
+      // treat null-expiry as always-stale, so a cached null-expiry token would force every
+      // future request back through this slow path with no benefit.
       cacheRef.set(token);
     }
     sharedFailureState.set(false);
