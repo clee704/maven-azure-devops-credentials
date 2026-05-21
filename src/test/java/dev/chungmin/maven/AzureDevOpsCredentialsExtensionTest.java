@@ -690,13 +690,42 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
 
     extension.afterProjectsRead(session);
-    // Boot-time getAccessToken(): 1 call.
+    // Boot-time getAccessToken(): 1 call. The boot fetch also pre-populates the live-path
+    // cache with the AccessToken (N3 fix) so the next entrySet() call hits the cache and
+    // doesn't fork a second `az` subprocess for AzureCliCredential.
     verify(mockCredential, times(1)).getToken(any());
 
-    // First entrySet() call by the resolver: 2 total calls, ALL going to the same mock.
+    // First entrySet() call by the resolver: cache hit (boot pre-populated), still 1 total.
     Object headers = repoSession.getConfigProperties().get("aether.connector.http.headers.MyFeed");
-    ((java.util.Map<?, ?>) headers).entrySet();
-    verify(mockCredential, times(2)).getToken(any());
+    java.util.Map.Entry<?, ?> entry = ((java.util.Map<?, ?>) headers).entrySet().iterator().next();
+    assertEquals("Bearer test-token", entry.getValue());
+    verify(mockCredential, times(1)).getToken(any());
+  }
+
+  @Test
+  public void afterProjectsRead_bootFetchPrePopulatesLivePathCache()
+      throws MavenExecutionException {
+    // N3: explicit regression catcher for the boot-fetch -> live-path cache hand-off. Without
+    // the pre-populate, the first Aether HTTP request would fork a second `az` subprocess
+    // for AzureCliCredential (no SDK cache for CLI tokens). With it, we get exactly one
+    // getToken() call across boot + first 3 entrySet() requests within the cache TTL.
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("FeedA"), adoRepo("FeedB")));
+    when(project.getRemoteArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(project.getPluginArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("boot-token", OffsetDateTime.now().plusHours(1))));
+
+    extension.afterProjectsRead(session);
+
+    Object feedAHeaders =
+        repoSession.getConfigProperties().get("aether.connector.http.headers.FeedA");
+    Object feedBHeaders =
+        repoSession.getConfigProperties().get("aether.connector.http.headers.FeedB");
+    ((java.util.Map<?, ?>) feedAHeaders).entrySet().iterator().next();
+    ((java.util.Map<?, ?>) feedBHeaders).entrySet().iterator().next();
+    ((java.util.Map<?, ?>) feedAHeaders).entrySet().iterator().next();
+    // 1 boot fetch + 0 live-path fetches (all 3 entrySet calls hit the pre-populated cache).
+    verify(mockCredential, times(1)).getToken(any());
   }
 
   @Test

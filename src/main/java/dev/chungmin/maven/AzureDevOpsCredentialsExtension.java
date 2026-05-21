@@ -177,6 +177,10 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // ~5 minutes before expiry. This eliminates the per-invocation token-staleness window that
     // bites builds longer than the token's lifetime (~60-75 minutes for Entra access tokens).
     TokenCredential credential = getSharedCredential();
+    // Cache reference declared at outer scope so the boot fetch below can pre-populate it
+    // (avoids a second `az` fork on the first live-path request — N3). null on non-Default
+    // sessions where no live map is installed; the boot fetch then doesn't pre-populate.
+    AtomicReference<AccessToken> sharedCachedToken = null;
     if (session.getRepositorySession() instanceof DefaultRepositorySystemSession) {
       DefaultRepositorySystemSession repoSession =
           (DefaultRepositorySystemSession) session.getRepositorySession();
@@ -199,7 +203,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       // 5 min before expiry, mirroring the Azure Identity SDK's own pre-expiry refresh
       // heuristic. Sharing across feeds is correct: a single user's token works for every ADO
       // Maven feed they have access to (the scope is the ADO resource ID, not per-feed).
-      AtomicReference<AccessToken> sharedCachedToken = new AtomicReference<>();
+      sharedCachedToken = new AtomicReference<>();
       for (String repoId : repoIds) {
         installSessionConfig(
             repoSession,
@@ -230,7 +234,11 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // The HTTP_HEADERS live Map above takes precedence for modern Aether HTTP transport and is
     // what makes long builds work; this static token only covers the legacy edges and is NOT
     // refreshed mid-build.
-    String token = getAccessToken(credential);
+    //
+    // We also pre-populate the live-path cache (when present) from this fetch's AccessToken,
+    // so the very first outbound Aether HTTP request hits the cache instead of forking a
+    // second `az` subprocess for AzureCliCredential (no SDK cache for CLI tokens).
+    String token = getAccessToken(credential, sharedCachedToken);
     if (token == null) {
       log.warn(
           "Failed to acquire initial Azure access token. Live header refresh will retry per request, "
@@ -774,11 +782,23 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   }
 
   private String getAccessToken(TokenCredential credential) {
+    return getAccessToken(credential, null);
+  }
+
+  // 2-arg overload: optionally pre-populate the live-path cache from the boot fetch's
+  // AccessToken. Used by afterProjectsRead so the first Aether HTTP request hits the cache
+  // instead of duplicating the `az` fork; AzureDevOpsAuthSelector (the only other caller)
+  // uses the 1-arg form because it has no cache reference to populate at that stage.
+  private String getAccessToken(
+      TokenCredential credential, AtomicReference<AccessToken> cacheToPopulate) {
     log.debug("Acquiring Azure Entra access token for Azure DevOps...");
     try {
       AccessToken token = blockForToken(credential);
       if (token != null) {
         log.debug("Azure Entra access token acquired successfully.");
+        if (cacheToPopulate != null) {
+          cacheToPopulate.set(token);
+        }
         return token.getToken();
       } else {
         log.warn("Token acquisition returned null.");
