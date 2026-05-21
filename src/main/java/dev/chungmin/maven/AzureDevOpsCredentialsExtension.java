@@ -137,6 +137,16 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   // fork its own `az` subprocess at startup.
   private final AtomicReference<AccessToken> sharedCachedToken = new AtomicReference<>();
 
+  // Shared warn-rate-limiter for credential-acquisition failures, used by the boot fetch
+  // (getAccessToken), the selector slow path (AzureDevOpsAuthSelector.getAuthentication), and
+  // the live-path per-request fetch (LiveBearerHeadersMap.acquireToken/noteFailure). One
+  // outage edge → one warn, regardless of which code path observes it first; the next
+  // successful acquisition (any path) resets the gate. Without sharing, a sustained outage
+  // on a workspace with N feeds would warn N times from the selector + N times per
+  // entrySet() call from the live-headers maps — exactly the log spam the live-path gate
+  // was designed to prevent.
+  private final AtomicBoolean sharedFailureState = new AtomicBoolean(false);
+
   // Lazily-initialized credential, shared across all three token-consuming code paths:
   // the Aether AuthenticationSelector (afterSessionStart), the LiveBearerHeadersMap entries
   // (afterProjectsRead), and the legacy Server.password injection (afterProjectsRead). Sharing
@@ -168,6 +178,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // builds — without clearing here, the second build's selector and live-headers paths
     // would see the previous build's potentially-expired token and skip the fresh fetch.
     sharedCachedToken.set(null);
+    sharedFailureState.set(false);
     // Suppress noisy [ERROR] messages from ChainedTokenCredential trying each credential provider
     // in turn. SLF4J SimpleLogger (Maven's default binding) reads this property when the
     // com.azure.identity logger is first created, so setting it once here covers every later
@@ -227,10 +238,6 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     if (session.getRepositorySession() instanceof DefaultRepositorySystemSession) {
       DefaultRepositorySystemSession repoSession =
           (DefaultRepositorySystemSession) session.getRepositorySession();
-      // Share one warn-rate-limiter across every per-repo LiveBearerHeadersMap. A credential
-      // outage affects all feeds simultaneously (they share `credential`), so without this we'd
-      // warn N times per outage on a workspace with N ADO feeds.
-      AtomicBoolean sharedFailureState = new AtomicBoolean(false);
       // Share one single-flight gate across every per-repo LiveBearerHeadersMap. Aether's
       // resolver runs N threads (1C-multiplied by `mvn -T`); each entrySet() call would
       // otherwise race directly into credential.getToken(), and AzureCliCredential forks a
@@ -238,16 +245,29 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       // would fork N `az` processes simultaneously; with it, the first thread fetches and the
       // rest await the same future. The reference clears immediately after each acquisition,
       // so the NEXT burst gets a fresh fetch.
+      //
+      // Scope caveat: this single-flight gate is consulted ONLY inside
+      // LiveBearerHeadersMap.acquireTokenSingleFlight. The boot fetch below and the selector
+      // slow path call getAccessToken directly and do NOT join an in-flight future. In the
+      // typical sequential Maven lifecycle (afterSessionStart → POM resolution (selector) →
+      // afterProjectsRead (boot fetch) → resolver phases (live-path)) the cache
+      // pre-population reduces the fork count to one. If the lifecycle overlaps — mvnd
+      // parallel-module mode, an outer extension that triggers resolver work between hooks,
+      // or unlucky timing on the boot/selector hand-off — 2-3 concurrent `az` forks can still
+      // happen at startup. Bounded to startup and never observable thereafter; tracked as a
+      // follow-up rather than blocking this release.
       AtomicReference<CompletableFuture<AccessToken>> sharedInFlightToken = new AtomicReference<>();
-      // sharedCachedToken is the per-instance field — already shared with the selector
-      // (constructed in afterSessionStart). Threading it through every per-repo
-      // LiveBearerHeadersMap means a single user's AccessToken serves every feed AND every
-      // code path (selector, live-headers, boot fetch) with at most one `az` fork.
+      // sharedCachedToken AND sharedFailureState are extension-instance fields — already
+      // shared with the selector (constructed in afterSessionStart) and with getAccessToken
+      // itself. Threading them through every per-repo LiveBearerHeadersMap means: a single
+      // user's AccessToken serves every feed AND every code path; a single outage warns at
+      // most once across the boot fetch, the selector slow path, AND every per-repo
+      // live-headers map (instead of N + per-request).
       for (String repoId : repoIds) {
         installSessionConfig(
             repoSession,
             ConfigurationProperties.HTTP_HEADERS + "." + repoId,
-            new LiveBearerHeadersMap(
+            LiveBearerHeadersMap.production(
                 credential, log, sharedFailureState, sharedInFlightToken, sharedCachedToken));
       }
     } else {
@@ -578,42 +598,12 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // are treated as stale and trigger a fresh fetch.
     private final AtomicReference<AccessToken> cachedToken;
 
-    LiveBearerHeadersMap(TokenCredential credential) {
-      this(
-          credential,
-          log,
-          new AtomicBoolean(false),
-          new AtomicReference<>(),
-          new AtomicReference<>());
-    }
-
-    // Logger-injection overload exists so unit tests can verify the warn rate-limiter without
-    // pulling in an SLF4J test appender dependency. Production callers always use the
-    // single-arg constructor or the five-arg variant that shares the warn-rate gate, the
-    // single-flight gate, and the token cache across every per-repo instance.
-    LiveBearerHeadersMap(TokenCredential credential, org.slf4j.Logger logger) {
-      this(
-          credential,
-          logger,
-          new AtomicBoolean(false),
-          new AtomicReference<>(),
-          new AtomicReference<>());
-    }
-
-    LiveBearerHeadersMap(
-        TokenCredential credential, org.slf4j.Logger logger, AtomicBoolean sharedFailureState) {
-      this(
-          credential, logger, sharedFailureState, new AtomicReference<>(), new AtomicReference<>());
-    }
-
-    LiveBearerHeadersMap(
-        TokenCredential credential,
-        org.slf4j.Logger logger,
-        AtomicBoolean sharedFailureState,
-        AtomicReference<CompletableFuture<AccessToken>> sharedInFlightToken) {
-      this(credential, logger, sharedFailureState, sharedInFlightToken, new AtomicReference<>());
-    }
-
+    // SOLE constructor — production callers in afterProjectsRead use this directly with the
+    // extension's instance-field shared state (sharedFailureState, sharedInFlightToken,
+    // sharedCachedToken); the LiveBearerHeadersMap.forTest(...) factories below wrap this
+    // for unit tests that want subsets of the shared state with auto-allocated defaults.
+    // Keeping one constructor + named factories rather than a 1/2/3/4/5-arg telescoping
+    // chain makes the production-vs-test split visually unambiguous to a future maintainer.
     LiveBearerHeadersMap(
         TokenCredential credential,
         org.slf4j.Logger logger,
@@ -625,6 +615,55 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       this.inFailureState = sharedFailureState;
       this.inFlightToken = sharedInFlightToken;
       this.cachedToken = sharedCachedToken;
+    }
+
+    // Named production builder — readers of afterProjectsRead see `production(...)` and know
+    // exactly which call site is the live, shipped path (vs. the test factories below).
+    static LiveBearerHeadersMap production(
+        TokenCredential credential,
+        org.slf4j.Logger logger,
+        AtomicBoolean sharedFailureState,
+        AtomicReference<CompletableFuture<AccessToken>> sharedInFlightToken,
+        AtomicReference<AccessToken> sharedCachedToken) {
+      return new LiveBearerHeadersMap(
+          credential, logger, sharedFailureState, sharedInFlightToken, sharedCachedToken);
+    }
+
+    // Test factories — explicit `forTest` naming so production code grep doesn't surface
+    // them as ambiguous candidates. Each fills the remaining shared-state slots with fresh
+    // local refs so the test instance is self-contained.
+    static LiveBearerHeadersMap forTest(TokenCredential credential) {
+      return forTest(credential, log);
+    }
+
+    static LiveBearerHeadersMap forTest(TokenCredential credential, org.slf4j.Logger logger) {
+      return forTest(credential, logger, new AtomicBoolean(false));
+    }
+
+    static LiveBearerHeadersMap forTest(
+        TokenCredential credential, org.slf4j.Logger logger, AtomicBoolean sharedFailureState) {
+      return forTest(credential, logger, sharedFailureState, new AtomicReference<>());
+    }
+
+    static LiveBearerHeadersMap forTest(
+        TokenCredential credential,
+        org.slf4j.Logger logger,
+        AtomicBoolean sharedFailureState,
+        AtomicReference<CompletableFuture<AccessToken>> sharedInFlightToken) {
+      return new LiveBearerHeadersMap(
+          credential, logger, sharedFailureState, sharedInFlightToken, new AtomicReference<>());
+    }
+
+    // Full-fidelity test factory: same shape as production(...) but named with the test
+    // prefix so a future reader greping "forTest" surfaces it as the unit-test seam.
+    static LiveBearerHeadersMap forTest(
+        TokenCredential credential,
+        org.slf4j.Logger logger,
+        AtomicBoolean sharedFailureState,
+        AtomicReference<CompletableFuture<AccessToken>> sharedInFlightToken,
+        AtomicReference<AccessToken> sharedCachedToken) {
+      return new LiveBearerHeadersMap(
+          credential, logger, sharedFailureState, sharedInFlightToken, sharedCachedToken);
     }
 
     @Override
@@ -861,6 +900,11 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   // so the resolved AccessToken is published to the shared cache before this method returns,
   // making the next caller — wherever it comes from — hit the cache instead of forking
   // another `az` subprocess.
+  //
+  // Warn rate-limiting: both failure messages go through compareAndSet on
+  // sharedFailureState — the same gate the live-headers path uses for noteFailure.
+  // A sustained outage on a workspace with N feeds + N selector calls + N live-headers
+  // calls warns ONCE total per outage edge, not 3N times.
   private String getAccessToken(
       TokenCredential credential, AtomicReference<AccessToken> cacheToPopulate) {
     log.debug("Acquiring Azure Entra access token for Azure DevOps...");
@@ -871,9 +915,14 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         if (cacheToPopulate != null) {
           cacheToPopulate.set(token);
         }
+        sharedFailureState.set(false);
         return token.getToken();
       } else {
-        log.warn("Token acquisition returned null.");
+        if (sharedFailureState.compareAndSet(false, true)) {
+          log.warn(
+              "Token acquisition returned null. Subsequent failures will be suppressed until"
+                  + " the next successful refresh.");
+        }
         return null;
       }
     } catch (RuntimeException e) {
@@ -881,10 +930,13 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       // environment variables, and Managed Identity in order. Steer the user toward the
       // most common remediation for each (local dev → `az login`; CI / VM → check env
       // vars or VM identity assignment) instead of assuming CLI is the only path.
-      log.warn(
-          "Failed to acquire Azure access token. Tried Azure CLI, environment variables,"
-              + " and Managed Identity — none succeeded. Try `az login` locally, or check"
-              + " `AZURE_CLIENT_ID` / Managed Identity role assignment on this host.");
+      if (sharedFailureState.compareAndSet(false, true)) {
+        log.warn(
+            "Failed to acquire Azure access token. Tried Azure CLI, environment variables,"
+                + " and Managed Identity — none succeeded. Try `az login` locally, or check"
+                + " `AZURE_CLIENT_ID` / Managed Identity role assignment on this host."
+                + " Subsequent failures will be suppressed until the next successful refresh.");
+      }
       log.debug("Token acquisition error: {}", e.toString());
       return null;
     }
