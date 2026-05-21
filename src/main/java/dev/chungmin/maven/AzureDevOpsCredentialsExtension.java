@@ -785,14 +785,22 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       return fallback;
     }
 
-    // Single-flight via AtomicReference<CompletableFuture>: the FIRST thread into a burst
-    // installs its own future as the in-flight marker, then calls credential.getToken();
-    // every later thread sees the existing future and waits on it. When the leader finishes
-    // (success or failure), it completes the future and clears the reference, so the NEXT
-    // burst starts a fresh fetch — we intentionally do NOT cache the AccessToken across
-    // bursts, leaving expiry tracking to the SDK (or to the next acquire attempt, which is
-    // cheap once the SDK's internal state is warm). The retry loop handles the rare race
-    // where the leader clears the reference between get() and compareAndSet().
+    // Single-flight via AtomicReference<CompletableFuture>: only runs when acquireToken's
+    // fast-path cache check missed (cache empty OR within the 5-minute refresh window).
+    // The FIRST thread into a burst installs its own future as the in-flight marker, then
+    // calls credential.getToken(); every later thread sees the existing future and joins it
+    // — at most one `az` subprocess fork per concurrent burst even under mvn -T 1C resolver
+    // pressure. The leader populates `cachedToken` BEFORE completing the future and clearing
+    // the in-flight reference (see L815-820), so any waiter that re-enters acquireToken
+    // after returning hits the fast-path cache on its next call and never reaches here.
+    // The retry loop handles the rare race where the leader clears the reference between
+    // peekInFlight() and tryClaimLeadership().
+    //
+    // Expiry tracking is the extension's own — isNearExpiry() + the 5-minute
+    // TOKEN_REFRESH_BEFORE_EXPIRY_MINUTES window on the outer class — NOT the SDK's. The
+    // headline credential (AzureCliCredential) has no internal token cache and shells out
+    // `az account get-access-token` per call (the M1 rationale captured at L611-619); the
+    // local AccessToken cache is what makes the per-request entrySet() invocation cheap.
     //
     // The AtomicReference operations below go through three overridable seams
     // (peekInFlight / tryClaimLeadership / releaseLeadership) rather than direct method
