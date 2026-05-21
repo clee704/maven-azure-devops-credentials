@@ -76,7 +76,7 @@ Java 8 or higher is required.
 ## Limitations
 
 - Only supports Azure DevOps Services (cloud). Azure DevOps Server (on-premises) is not supported, as it uses custom domains that cannot be auto-detected.
-- Token refresh applies only to artifact downloads that flow through Aether's `HttpTransporter` (the standard Maven Resolver HTTP layer used by Maven 3.3+ for dependency, plugin, and metadata fetches). Plugins or transports that bypass Aether and read `<server>` passwords directly (e.g. `wagon-http`) will still see only the boot-time token.
+- Token refresh applies to all HTTP requests (downloads, uploads, metadata) that flow through Aether's `HttpTransporter` — the standard Maven Resolver HTTP layer used by Maven 3.3+ for dependency, plugin, and metadata fetches, and by `mvn deploy` for uploads. Plugins or transports that bypass Aether and read `<server>` passwords directly (e.g. `wagon-http`) will still see only the boot-time token.
 
 ## Troubleshooting
 

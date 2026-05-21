@@ -686,7 +686,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     assertEquals("Bearer recovered", map.entrySet().iterator().next().getValue());
     assertTrue(map.entrySet().isEmpty());
     verify(mockCredential, times(3)).getToken(any());
-    // TWO warns total: one per fail-1 -> success transition gap.
+    // Two warns total: one per fail edge, with the success in between re-arming the gate.
     verify(mockLog, times(2)).warn(anyString(), anyString(), any(Throwable.class));
   }
 
@@ -698,8 +698,10 @@ public class AzureDevOpsCredentialsExtensionTest {
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
         new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
     String s = map.toString();
-    assertFalse("toString must not contain a Bearer token", s.contains("Bearer"));
-    assertFalse("toString must not invoke the credential", s.contains("Authorization"));
+    assertFalse("toString must not contain a Bearer token", s.contains("Bearer "));
+    // The label intentionally surfaces the header *names* (keys=[Authorization]) for
+    // debugging; it must NOT include the values.
+    assertFalse("toString must not contain JWT-shaped payload", s.contains("eyJ"));
     verify(mockCredential, never()).getToken(any());
   }
 

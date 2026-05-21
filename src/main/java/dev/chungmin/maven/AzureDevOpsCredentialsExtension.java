@@ -395,10 +395,17 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // token-free label instead.
     @Override
     public String toString() {
-      return "AzureDevOpsLiveAuthHeaders";
+      return "AzureDevOpsLiveAuthHeaders{keys=[Authorization]}";
     }
 
     private String acquireToken() {
+      // Not single-flighted at this layer: under burst load (e.g. parallel resolver pool
+      // crossing the 5-min pre-expiry refresh window) every thread enters credential.getToken()
+      // concurrently. We rely on the Azure Identity SDK's internal token cache to coalesce
+      // these into a single chain walk + N cache hits. If a future SDK or credential chain
+      // change breaks that single-flight, this would degenerate to N parallel `az` subprocess
+      // invocations; adding a synchronized gate here would serialize EVERY per-request entrySet()
+      // call (the common path: cached token, no SDK round-trip), which is a worse trade.
       try {
         TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
         AccessToken token = credential.getToken(request).block();
@@ -416,6 +423,10 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       }
     }
 
+    // At-most-once-per-outage warn gate. Steady-state guarantee. Under concurrent
+    // failure<->success thrash (rare and non-load-bearing) we may double-fire, because the
+    // success-path set(false) and the failure-path compareAndSet(false,true) are not atomic
+    // with each other — tolerable for a log rate-limiter.
     private void noteFailure(String reason, Throwable cause) {
       if (inFailureState.compareAndSet(false, true)) {
         // Pass the cause as the trailing argument so SLF4J formats with parameterized
