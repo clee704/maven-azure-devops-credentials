@@ -563,14 +563,22 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // bursts, leaving expiry tracking to the SDK (or to the next acquire attempt, which is
     // cheap once the SDK's internal state is warm). The retry loop handles the rare race
     // where the leader clears the reference between get() and compareAndSet().
+    //
+    // The AtomicReference operations below go through three overridable seams
+    // (peekInFlight / tryClaimLeadership / releaseLeadership) rather than direct method
+    // calls on inFlightToken. AtomicReference.get() and compareAndSet() are final and can't
+    // be mocked under our test infrastructure (mockito-core, no inline mock maker — keeps
+    // the Java 21 byte-buddy-agent attachment problem at bay), so this is the only practical
+    // way to deterministically exercise the lost-CAS loop branch from a unit test without
+    // adding flaky concurrent timing dependencies.
     private AccessToken acquireTokenSingleFlight() {
       while (true) {
-        CompletableFuture<AccessToken> existing = inFlightToken.get();
+        CompletableFuture<AccessToken> existing = peekInFlight();
         if (existing != null) {
           return joinUnwrapped(existing);
         }
         CompletableFuture<AccessToken> myFuture = new CompletableFuture<>();
-        if (inFlightToken.compareAndSet(null, myFuture)) {
+        if (tryClaimLeadership(myFuture)) {
           try {
             AccessToken token = blockForToken(credential);
             myFuture.complete(token);
@@ -590,11 +598,25 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
             myFuture.completeExceptionally(e);
             throw e;
           } finally {
-            inFlightToken.set(null);
+            releaseLeadership();
           }
         }
         // Lost the CAS; another thread just installed its own future. Loop to join it.
       }
+    }
+
+    // Package-private test seams; production calls flow straight through to the
+    // underlying AtomicReference. See acquireTokenSingleFlight for the rationale.
+    CompletableFuture<AccessToken> peekInFlight() {
+      return inFlightToken.get();
+    }
+
+    boolean tryClaimLeadership(CompletableFuture<AccessToken> myFuture) {
+      return inFlightToken.compareAndSet(null, myFuture);
+    }
+
+    void releaseLeadership() {
+      inFlightToken.set(null);
     }
 
     private static AccessToken joinUnwrapped(CompletableFuture<AccessToken> future) {

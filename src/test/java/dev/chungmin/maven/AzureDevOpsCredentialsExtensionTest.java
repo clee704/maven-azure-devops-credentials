@@ -974,6 +974,46 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
+  public void liveBearerHeadersMap_singleFlightLostCasLoopsAndJoinsWinner() {
+    // The "lost the CAS" branch in acquireTokenSingleFlight is only reachable under a TOCTOU
+    // race: peekInFlight() returns null, then between peek and tryClaimLeadership another
+    // thread installs its own future, then our tryClaimLeadership returns false. We loop
+    // back, find the winning future via the next peek, and joinUnwrapped() it without
+    // calling credential.getToken() ourselves. Real concurrent threads can't reliably
+    // exercise this branch — simulate the race deterministically by subclassing
+    // LiveBearerHeadersMap and overriding the package-private peek/tryClaim seams.
+    //
+    // Without this test, JaCoCo INSTRUCTION coverage drops to 99% on Java 8/11 because the
+    // closing brace of the while(true) loop emits a back-edge GOTO that older javac/JaCoCo
+    // tracks as a distinct instruction; Java 17+ bytecode elides it.
+    AccessToken winningToken = new AccessToken("winner-token", OffsetDateTime.now().plusHours(1));
+    java.util.concurrent.CompletableFuture<AccessToken> winningFuture =
+        java.util.concurrent.CompletableFuture.completedFuture(winningToken);
+    java.util.concurrent.atomic.AtomicInteger peekCalls =
+        new java.util.concurrent.atomic.AtomicInteger();
+
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential) {
+          @Override
+          java.util.concurrent.CompletableFuture<AccessToken> peekInFlight() {
+            // First call (entering the loop): looks empty, no in-flight token.
+            // Subsequent call (after losing CAS, looping back): winner is installed.
+            return peekCalls.getAndIncrement() == 0 ? null : winningFuture;
+          }
+
+          @Override
+          boolean tryClaimLeadership(java.util.concurrent.CompletableFuture<AccessToken> f) {
+            // Always lose — somebody else won between our peek and CAS.
+            return false;
+          }
+        };
+
+    assertEquals("Bearer winner-token", map.entrySet().iterator().next().getValue());
+    // Critical: we joined the winner's future instead of forking our own token request.
+    verify(mockCredential, never()).getToken(any());
+  }
+
+  @Test
   public void afterSessionStart_nonDefaultRepositorySession_skipsWithWarning()
       throws MavenExecutionException {
     // M1: a custom RepositorySystemSession (mvnd, future Maven that wraps the session,
