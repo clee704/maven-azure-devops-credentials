@@ -488,6 +488,91 @@ public class AzureDevOpsCredentialsExtensionTest {
     verify(mockCredential, times(1)).getToken(any());
   }
 
+  @Test
+  public void afterSessionStart_selectorShareCacheWithLivePath() throws MavenExecutionException {
+    // N4: the selector's slow-path getAccessToken now writes to sharedCachedToken, so a
+    // later live-path entrySet() call hits the cache instead of forking a second `az`
+    // subprocess. Pre-N4 this would be 2 `getToken()` calls (1 selector + 1 live-path);
+    // after the fix it's 1.
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(project.getRemoteArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(project.getPluginArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
+
+    // afterSessionStart installs the selector; calling getAuthentication here forces the
+    // selector's slow-path fetch BEFORE afterProjectsRead's boot fetch (simulates the
+    // ordering where Aether starts resolving project poms before the lifecycle reaches
+    // afterProjectsRead — rare but possible with some Maven configurations).
+    extension.afterSessionStart(session);
+    AuthenticationSelector selector = repoSession.getAuthenticationSelector();
+    selector.getAuthentication(adoRemoteRepo("MyFeed"));
+
+    // Now run afterProjectsRead — its boot fetch would normally also call getToken, but
+    // the selector already populated sharedCachedToken so this should hit the cache.
+    extension.afterProjectsRead(session);
+
+    // Plus a live-path call should also hit the cache.
+    Object headers = repoSession.getConfigProperties().get("aether.connector.http.headers.MyFeed");
+    ((java.util.Map<?, ?>) headers).entrySet().iterator().next();
+
+    // Exactly ONE getToken() call across selector + boot fetch + live-path request.
+    verify(mockCredential, times(1)).getToken(any());
+  }
+
+  @Test
+  public void afterSessionStart_selectorConcurrentCallsCoalesceToOneFetch() throws Exception {
+    // N4 coverage: 8 threads call getAuthentication simultaneously. All see an empty cache
+    // on the fast path (sharedCachedToken just reset by afterSessionStart), enter the
+    // synchronized slow path, and the leader fetches + populates while the other 7 take
+    // the cache-recheck-hit branch on lock re-entry. Result: exactly ONE getToken() across
+    // all 8 calls.
+    int threadCount = 8;
+    java.util.concurrent.CountDownLatch workersReady =
+        new java.util.concurrent.CountDownLatch(threadCount);
+    java.util.concurrent.CountDownLatch startLatch = new java.util.concurrent.CountDownLatch(1);
+    java.util.concurrent.CountDownLatch leaderInGetToken =
+        new java.util.concurrent.CountDownLatch(1);
+    java.util.concurrent.CountDownLatch releaseLeader = new java.util.concurrent.CountDownLatch(1);
+
+    when(mockCredential.getToken(any()))
+        .thenAnswer(
+            invocation -> {
+              leaderInGetToken.countDown();
+              releaseLeader.await();
+              return Mono.just(new AccessToken("shared-token", OffsetDateTime.now().plusHours(1)));
+            });
+
+    extension.afterSessionStart(session);
+    AuthenticationSelector selector = repoSession.getAuthenticationSelector();
+
+    java.util.concurrent.ExecutorService pool =
+        java.util.concurrent.Executors.newFixedThreadPool(threadCount);
+    try {
+      java.util.List<java.util.concurrent.Future<Authentication>> futures = new ArrayList<>();
+      for (int i = 0; i < threadCount; i++) {
+        futures.add(
+            pool.submit(
+                () -> {
+                  workersReady.countDown();
+                  startLatch.await();
+                  return selector.getAuthentication(adoRemoteRepo("MyFeed"));
+                }));
+      }
+      assertTrue(workersReady.await(5, java.util.concurrent.TimeUnit.SECONDS));
+      startLatch.countDown();
+      assertTrue(leaderInGetToken.await(5, java.util.concurrent.TimeUnit.SECONDS));
+      releaseLeader.countDown();
+      for (java.util.concurrent.Future<Authentication> f : futures) {
+        assertNotNull(f.get(5, java.util.concurrent.TimeUnit.SECONDS));
+      }
+    } finally {
+      pool.shutdown();
+    }
+
+    verify(mockCredential, times(1)).getToken(any());
+  }
+
   // === LiveBearerHeadersMap ===
 
   @Test
