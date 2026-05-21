@@ -72,6 +72,18 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   private static final String AZURE_IDENTITY_LOG_PROPERTY =
       "org.slf4j.simpleLogger.log.com.azure.identity";
 
+  // Shared actionable-remediation suffix appended to every credential-acquisition WARN
+  // (live-headers noteFailure + boot/selector useFallbackOrWarnUnauthenticated). Steers
+  // the user toward the most common remediation for each credential the
+  // DefaultAzureCredentialBuilder chain in createCredential() tries — instead of leaving
+  // the live path with just symptom + rate-limit promise (N29). Single literal, two
+  // call sites; preserves each warn's site-specific prefix.
+  private static final String CREDENTIAL_FAILURE_REMEDIATION =
+      "Tried Azure CLI, environment variables, and Managed Identity — none succeeded."
+          + " Try `az login` locally, or check `AZURE_CLIENT_ID` / Managed Identity role"
+          + " assignment on this host."
+          + " Subsequent failures will be suppressed until the next successful refresh.";
+
   @Inject private RepositorySystem repositorySystem;
 
   // Per-call TokenRequestContext factory. Builds a fresh request on every blockForToken
@@ -925,16 +937,15 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       if (inFailureState.compareAndSet(false, true)) {
         // Pass the cause as the trailing argument so SLF4J formats with parameterized
         // placeholders (lazy concat) AND preserves the stacktrace when a logging backend
-        // is bound that prints it.
+        // is bound that prints it. Suffix matches the boot/selector-path WARN so a user
+        // hitting this mid-build (the headline scenario this PR addresses) gets the same
+        // actionable remediation hints as a user hitting the boot/selector failure.
         if (cause == null) {
           logger.warn(
-              "{}. Request will go out unauthenticated; subsequent failures will be suppressed"
-                  + " until the next successful refresh.",
-              reason);
+              "{}. Request will go out unauthenticated. " + CREDENTIAL_FAILURE_REMEDIATION, reason);
         } else {
           logger.warn(
-              "{}. Request will go out unauthenticated; subsequent failures will be suppressed"
-                  + " until the next successful refresh.",
+              "{}. Request will go out unauthenticated. " + CREDENTIAL_FAILURE_REMEDIATION,
               reason,
               cause);
         }
@@ -1052,11 +1063,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       // The DefaultAzureCredentialBuilder chain in createCredential() tries Azure CLI,
       // environment variables, and Managed Identity in order. Steer the user toward the
       // most common remediation for each instead of assuming CLI is the only path.
-      log.warn(
-          "Failed to acquire Azure access token. Tried Azure CLI, environment variables,"
-              + " and Managed Identity — none succeeded. Try `az login` locally, or check"
-              + " `AZURE_CLIENT_ID` / Managed Identity role assignment on this host."
-              + " Subsequent failures will be suppressed until the next successful refresh.");
+      log.warn("Failed to acquire Azure access token. " + CREDENTIAL_FAILURE_REMEDIATION);
     }
     return null;
   }
