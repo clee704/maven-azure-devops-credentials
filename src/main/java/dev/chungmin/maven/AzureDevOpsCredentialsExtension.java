@@ -74,18 +74,16 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
 
   @Inject private RepositorySystem repositorySystem;
 
-  // Shared scopes spec for every token acquisition (boot path getAccessToken + live path
-  // LiveBearerHeadersMap.acquireToken). One source of truth; if a future change needs new
-  // scopes / claims / tenant overrides, do it here, not in two near-identical spots.
-  //
-  // Assumption: no credential in the chain (CLI, Environment, ManagedIdentity at time of
-  // writing) mutates the request. TokenRequestContext IS mutable (addScopes / setClaims /
-  // setTenantId / setCaeEnabled), so if a future Azure Identity revision — or a new credential
-  // type added to the chain — calls those during getToken(), this shared instance would be
-  // corrupted JVM-wide. If that day arrives, switch this back to a per-call allocation (the
-  // cost is one short-lived object per HTTP request).
-  private static final TokenRequestContext TOKEN_REQUEST =
-      new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
+  // Per-call TokenRequestContext factory. Builds a fresh request on every blockForToken
+  // invocation so any future SDK that mutates the request in-place (TokenRequestContext IS
+  // mutable: addScopes / setClaims / setTenantId / setCaeEnabled) corrupts only its own
+  // request, not a JVM-wide shared constant. Allocation cost is sub-µs and scavenge-collected
+  // — outweighed by the lockup-debugging cost of an SDK bump silently issuing wrong-scope
+  // tokens against a tenant-scoped feed. AZURE_DEVOPS_SCOPE remains the single source of
+  // truth for the scope spec.
+  private static TokenRequestContext newTokenRequest() {
+    return new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
+  }
 
   // Hard ceiling on a single token acquisition. Without this, .block() (which has no
   // implicit timeout) can hang the entire Maven build forever if anything in the credential
@@ -115,7 +113,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   // hang risk) can hit the timeout path within unit-test time budgets instead of waiting
   // the full 2-minute production ceiling.
   static AccessToken blockForToken(TokenCredential credential, Duration timeout) {
-    return credential.getToken(TOKEN_REQUEST).block(timeout);
+    return credential.getToken(newTokenRequest()).block(timeout);
   }
 
   // Pre-expiry refresh window: a cached token within this many minutes of expiry is treated
@@ -442,13 +440,19 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       // route through the same graceful-degradation path as a NoSuchFieldException — log
       // once, fall back to the boot-time settings injection, build keeps working.
       if (reflectionFailureLogged.compareAndSet(false, true)) {
+        // Trailing `e` (in addition to the `{}` Cause placeholder filled by e.toString())
+        // attaches the stack trace via SLF4J's parameterized API — SLF4J treats the last
+        // arg as a Throwable when there are more args than placeholders. Without it the
+        // user troubleshooting this rare path (JPMS, SecurityManager, immutable Aether
+        // Map) gets the message but no JDK frame pointing at the rejection.
         log.error(
             "Could not install live Authorization header for '{}'; mid-build token refresh is"
                 + " disabled and `mvn` invocations longer than the Entra token TTL"
                 + " (~60-75 minutes) will fail with HTTP 401. Subsequent feeds in this build"
                 + " will fail identically; suppressing further error logs. Cause: {}",
             key,
-            e.toString());
+            e.toString(),
+            e);
       }
       return;
     }
@@ -963,9 +967,17 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
 
   private String useFallbackOrWarnUnauthenticated(AtomicReference<AccessToken> cacheRef) {
     if (cacheRef != null) {
-      String fallback = cachedTokenIfStillRealValid(cacheRef.get());
+      // Capture the cached AccessToken before the validity check so we can log its expiry
+      // timestamp on the fallback-served debug line (matches the live-path's
+      // graceful401AvoidanceFallback format — same data, same log shape, both diagnostic
+      // sites surface "how much real headroom does my fallback have left").
+      AccessToken cached = cacheRef.get();
+      String fallback = cachedTokenIfStillRealValid(cached);
       if (fallback != null) {
-        log.debug("Token refresh failed; serving cached token still valid until its expiry.");
+        log.debug(
+            "Token refresh failed; serving cached token still valid until {}. Will retry"
+                + " refresh on the next request.",
+            cached.getExpiresAt());
         return fallback;
       }
     }

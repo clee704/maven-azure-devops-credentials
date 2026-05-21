@@ -1073,6 +1073,29 @@ public class AzureDevOpsCredentialsExtensionTest {
     verify(mockCredential, never()).getToken(any());
   }
 
+  @Test
+  public void blockForToken_allocatesFreshTokenRequestContextPerCall() {
+    // N10 regression catcher: every blockForToken call must allocate a NEW
+    // TokenRequestContext via newTokenRequest(). TokenRequestContext is mutable (addScopes /
+    // setClaims / setTenantId / setCaeEnabled) — a future Azure Identity revision that
+    // starts mutating the request inside getToken would corrupt a shared static constant
+    // JVM-wide and silently issue wrong-scope tokens. Capture the per-call argument and
+    // assert the two contexts are distinct instances.
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("t1", OffsetDateTime.now().plusHours(1))));
+    AzureDevOpsCredentialsExtension.blockForToken(mockCredential);
+    AzureDevOpsCredentialsExtension.blockForToken(mockCredential);
+    org.mockito.ArgumentCaptor<com.azure.core.credential.TokenRequestContext> captor =
+        org.mockito.ArgumentCaptor.forClass(com.azure.core.credential.TokenRequestContext.class);
+    verify(mockCredential, times(2)).getToken(captor.capture());
+    java.util.List<com.azure.core.credential.TokenRequestContext> contexts = captor.getAllValues();
+    assertNotSame(
+        "Each blockForToken call must allocate a fresh TokenRequestContext — a shared static"
+            + " constant would be JVM-wide-corruptible if a future SDK mutates the request",
+        contexts.get(0),
+        contexts.get(1));
+  }
+
   @Test(timeout = 5000)
   public void blockForToken_throwsIllegalStateExceptionWhenCredentialStalls() {
     // F2 regression catcher: a future refactor that drops the Duration arg from .block()
