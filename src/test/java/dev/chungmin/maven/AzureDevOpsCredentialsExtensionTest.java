@@ -967,16 +967,15 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
-  public void liveBearerHeadersMap_rewarnAfterRecovery() {
-    // Failure, then success (state reset), then failure again -> should warn twice total.
-    // M1 caveat: the success in the middle returns a NEAR-EXPIRY token; without that, the
-    // cache would short-circuit the third call and skip the SDK round-trip entirely, and the
-    // second warn would never fire because the failure path isn't reached. Near-expiry
-    // (2-min remaining) is treated as stale by isNearExpiry, so the third call re-enters the
-    // slow path and re-exercises the failure handler.
-    // N6 caveat: the third call falls back to the cached near-expiry token (still real-valid
-    // for 2 more minutes) instead of returning null. The rate-limiter still fires the warn
-    // edge — the fallback is graceful degradation, not a recovery.
+  public void liveBearerHeadersMap_fallbackSuppressesRewarnWhenStillRealValid() {
+    // F1: when a refresh fails AND the cached token is still real-valid, the user actually
+    // IS authenticated via the fallback — so the rate-limited WARN must not fire. Sequence:
+    //   - Call 1: cache empty, fetch fails, fallback null → WARN (1, the only one).
+    //   - Call 2: cache empty, fetch succeeds with near-expiry token → gate reset, cached.
+    //   - Call 3: cache near-expiry, fetch fails, fallback returns cached → NO warn.
+    // The "rewarn after recovery" property (gate re-arms on success) is still verified by
+    // the gate reset on call 2; a second warn WOULD fire IF call 3's fallback had been null
+    // (see rewarnAfterRecoveryWhenFallbackUnavailable below for that path).
     when(mockCredential.getToken(any()))
         .thenThrow(new RuntimeException("fail-1"))
         .thenReturn(Mono.just(new AccessToken("recovered", OffsetDateTime.now().plusMinutes(2))))
@@ -986,12 +985,37 @@ public class AzureDevOpsCredentialsExtensionTest {
         AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential, mockLog);
     assertNull(map.entrySet().iterator().next().getValue());
     assertEquals("Bearer recovered", map.entrySet().iterator().next().getValue());
-    // Third call: refresh fails but the cached "recovered" token still has real validity, so
-    // N6 fallback returns it instead of null.
+    // Third call: refresh fails but cached "recovered" still has real validity. F1: serve it,
+    // do NOT warn (the warn would lie about going unauthenticated).
     assertEquals("Bearer recovered", map.entrySet().iterator().next().getValue());
     verify(mockCredential, times(3)).getToken(any());
-    // Two warns total: one per fail edge, with the success in between re-arming the gate.
-    // Fallback doesn't suppress the warn — refresh genuinely failed.
+    // Exactly ONE warn — only call 1 had no fallback.
+    verify(mockLog, times(1)).warn(anyString(), anyString(), any(Throwable.class));
+  }
+
+  @Test
+  public void liveBearerHeadersMap_rewarnAfterRecoveryWhenFallbackUnavailable() {
+    // F1 corollary: after a successful refresh resets the gate, a subsequent failure with
+    // NO real-valid cached fallback (cache has a truly-expired token) DOES re-fire the
+    // WARN. Simulates the edge case where the recovered token was already past expiry by
+    // the time it was returned — fallback's `isAfter(now)` check correctly rejects it, and
+    // the gate re-fires.
+    when(mockCredential.getToken(any()))
+        .thenThrow(new RuntimeException("fail-1"))
+        .thenReturn(
+            Mono.just(new AccessToken("already-expired", OffsetDateTime.now().minusSeconds(10))))
+        .thenThrow(new RuntimeException("fail-2"));
+    org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential, mockLog);
+    assertNull(map.entrySet().iterator().next().getValue());
+    // Recovery — cache populated with the already-expired token. The gate is reset.
+    assertEquals("Bearer already-expired", map.entrySet().iterator().next().getValue());
+    // Third call: cache has truly-expired token, fetch fails, fallback NULL → WARN re-fires.
+    assertNull(map.entrySet().iterator().next().getValue());
+    verify(mockCredential, times(3)).getToken(any());
+    // Two warns total: one per fail edge, gate re-armed between them by the (technically
+    // successful but immediately stale) recovery in the middle.
     verify(mockLog, times(2)).warn(anyString(), anyString(), any(Throwable.class));
   }
 
@@ -1047,6 +1071,25 @@ public class AzureDevOpsCredentialsExtensionTest {
     // debugging; it must NOT include the values.
     assertFalse("toString must not contain JWT-shaped payload", s.contains("eyJ"));
     verify(mockCredential, never()).getToken(any());
+  }
+
+  @Test(timeout = 5000)
+  public void blockForToken_throwsIllegalStateExceptionWhenCredentialStalls() {
+    // F2 regression catcher: a future refactor that drops the Duration arg from .block()
+    // — i.e., reverts blockForToken to .block() instead of .block(timeout) — would silently
+    // re-introduce the indefinite-hang risk on a stuck credential (IMDS on a non-Azure VM,
+    // wedged `az` CLI, blackholed login.microsoftonline.com). Feed Mono.never() with a tiny
+    // test-only timeout and assert IllegalStateException fires within the deadline. The
+    // production timeout is 2 minutes (TOKEN_ACQUISITION_TIMEOUT) — too slow to wait in a
+    // unit test, hence the package-private 2-arg overload as the test seam.
+    TokenCredential stuck = mock(TokenCredential.class);
+    when(stuck.getToken(any())).thenReturn(Mono.never());
+    try {
+      AzureDevOpsCredentialsExtension.blockForToken(stuck, java.time.Duration.ofMillis(200));
+      fail("blockForToken must throw IllegalStateException when the credential never completes");
+    } catch (IllegalStateException expected) {
+      // expected on .block(Duration) timeout
+    }
   }
 
   @Test

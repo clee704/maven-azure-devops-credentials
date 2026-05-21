@@ -24,6 +24,7 @@ import com.azure.identity.EnvironmentCredentialBuilder;
 import com.azure.identity.ManagedIdentityCredentialBuilder;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.AbstractMap;
 import java.util.ArrayList;
@@ -86,13 +87,35 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   private static final TokenRequestContext TOKEN_REQUEST =
       new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
 
+  // Hard ceiling on a single token acquisition. Without this, .block() (which has no
+  // implicit timeout) can hang the entire Maven build forever if anything in the credential
+  // chain stalls: ManagedIdentityCredential's IMDS roundtrip to 169.254.169.254 on a
+  // misclassified non-Azure VM, a hung MSAL device-code prompt under AzureCliCredential,
+  // a frozen secret-storage daemon, a blackholed login.microsoftonline.com behind a broken
+  // corporate proxy. Pre-PR-1 a hang only happened at boot (Ctrl-C works, nothing has
+  // happened yet); now that every Aether HTTP request potentially routes through here on
+  // cache miss / refresh-window crossing, a hang would stop the build mid-resolve and is
+  // much harder to diagnose. Single-flight gating concentrates the blast radius: every
+  // waiting thread joins the same hung future. .block(Duration) throws IllegalStateException
+  // on timeout (a RuntimeException), which routes through the existing failure handlers →
+  // gated WARN → graceful fallback to a still-valid cached token if available.
+  private static final Duration TOKEN_ACQUISITION_TIMEOUT = Duration.ofMinutes(2);
+
   // Single point of credential.getToken() invocation. Both the boot path (getAccessToken,
   // for Settings.Server injection + AzureDevOpsAuthSelector cache) and the live path
   // (LiveBearerHeadersMap.acquireToken, called per outbound HTTP request from Aether) go
   // through this. Anything that needs to change about the SDK invocation — telemetry,
   // retry, scopes, timeout — applies to both automatically.
   static AccessToken blockForToken(TokenCredential credential) {
-    return credential.getToken(TOKEN_REQUEST).block();
+    return blockForToken(credential, TOKEN_ACQUISITION_TIMEOUT);
+  }
+
+  // Test seam: same as above but with a caller-supplied timeout, so the F2 regression test
+  // (a future refactor that drops the Duration arg and re-introduces the unbounded-block
+  // hang risk) can hit the timeout path within unit-test time budgets instead of waiting
+  // the full 2-minute production ceiling.
+  static AccessToken blockForToken(TokenCredential credential, Duration timeout) {
+    return credential.getToken(TOKEN_REQUEST).block(timeout);
   }
 
   // Pre-expiry refresh window: a cached token within this many minutes of expiry is treated
@@ -530,18 +553,12 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         if (cached != null && !isNearExpiry(cached)) {
           return buildAuth(cached.getToken());
         }
+        // F1 inversion + N6 fallback now live inside getAccessToken itself: on refresh
+        // failure it tries the still-real-valid cached token before warning, so a non-null
+        // return here is either a fresh token OR a cached fallback (both acceptable to
+        // serve), and a null return means refresh failed AND fallback was unavailable.
         String token = getAccessToken(getSharedCredential(), sharedCachedToken);
         if (token == null) {
-          // N6 fallback: refresh failed but the cached near-expiry token may still have
-          // real validity. Serve it instead of returning null (which produces a 401);
-          // the next request will retry the refresh.
-          String fallback = cachedTokenIfStillRealValid(cached);
-          if (fallback != null) {
-            log.debug(
-                "Selector token refresh failed; serving cached token still valid until {}.",
-                cached.getExpiresAt());
-            return buildAuth(fallback);
-          }
           return null;
         }
         return buildAuth(token);
@@ -727,18 +744,27 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       try {
         token = acquireTokenSingleFlight();
       } catch (RuntimeException e) {
+        // F1: invert fallback-before-warn order. The cached token may still have real
+        // validity (we entered the slow path because it's WITHIN the 5-min refresh window,
+        // not because it's truly expired). If fallback serves the request, the user is
+        // actually authenticated — a WARN saying "request will go out unauthenticated"
+        // would be a lie. Only warn when fallback genuinely can't save us.
+        String fallback = graceful401AvoidanceFallback(cached);
+        if (fallback != null) {
+          return fallback;
+        }
         noteFailure("Failed to refresh Azure access token mid-build", e);
-        // N6 fallback: refresh failed but the cached token may still have real validity
-        // left (we got here because it's WITHIN the 5-min pre-expiry refresh window, not
-        // because it's expired). Serve the cached token rather than forcing a 401 during
-        // a transient credential blip; we'll retry on the next request.
-        return graceful401AvoidanceFallback(cached);
+        return null;
       }
       if (token == null) {
-        // Mono.empty() — SDK returned no token without throwing. Same failure mode as the
-        // catch path (request will 401), so go through the same rate-limited warn helper.
+        // Mono.empty() — SDK returned no token without throwing. Same F1 ordering as the
+        // catch path: try fallback first, only warn when fallback is unavailable.
+        String fallback = graceful401AvoidanceFallback(cached);
+        if (fallback != null) {
+          return fallback;
+        }
         noteFailure("Azure credential returned no token (Mono.empty())", null);
-        return graceful401AvoidanceFallback(cached);
+        return null;
       }
       inFailureState.set(false);
       return token.getToken();
@@ -888,8 +914,12 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   }
 
   TokenCredential createCredential() {
+    // Defense-in-depth on top of TOKEN_ACQUISITION_TIMEOUT: cap the `az` subprocess at 30s
+    // so even on a wedged CLI we surface a meaningful error well before the outer .block()
+    // ceiling kicks in. The outer block() timeout still covers Environment + ManagedIdentity
+    // (which don't expose a processTimeout knob).
     return new ChainedTokenCredentialBuilder()
-        .addLast(new AzureCliCredentialBuilder().build())
+        .addLast(new AzureCliCredentialBuilder().processTimeout(Duration.ofSeconds(30)).build())
         .addLast(new EnvironmentCredentialBuilder().build())
         .addLast(new ManagedIdentityCredentialBuilder().build())
         .build();
@@ -901,44 +931,55 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   // making the next caller — wherever it comes from — hit the cache instead of forking
   // another `az` subprocess.
   //
-  // Warn rate-limiting: both failure messages go through compareAndSet on
-  // sharedFailureState — the same gate the live-headers path uses for noteFailure.
-  // A sustained outage on a workspace with N feeds + N selector calls + N live-headers
-  // calls warns ONCE total per outage edge, not 3N times.
-  private String getAccessToken(
-      TokenCredential credential, AtomicReference<AccessToken> cacheToPopulate) {
+  // F1 fallback-before-warn ordering: on refresh failure, we re-read cacheRef and serve a
+  // still-real-valid cached token if available. The WARN only fires when the request is
+  // actually going out unauthenticated (no token AND no fallback). This way the user only
+  // sees "Failed to acquire... going unauthenticated" when they will actually see a 401,
+  // not when fallback quietly served them.
+  //
+  // Warn rate-limiting: the failure warn goes through compareAndSet on sharedFailureState —
+  // the same gate the live-headers path uses for noteFailure. A sustained outage on a
+  // workspace with N feeds + N selector calls + N live-headers calls warns ONCE total per
+  // outage edge, not 3N times.
+  private String getAccessToken(TokenCredential credential, AtomicReference<AccessToken> cacheRef) {
     log.debug("Acquiring Azure Entra access token for Azure DevOps...");
+    AccessToken token;
     try {
-      AccessToken token = blockForToken(credential);
-      if (token != null) {
-        log.debug("Azure Entra access token acquired successfully.");
-        if (cacheToPopulate != null) {
-          cacheToPopulate.set(token);
-        }
-        sharedFailureState.set(false);
-        return token.getToken();
-      } else {
-        if (sharedFailureState.compareAndSet(false, true)) {
-          log.warn(
-              "Token acquisition returned null. Subsequent failures will be suppressed until"
-                  + " the next successful refresh.");
-        }
-        return null;
-      }
+      token = blockForToken(credential);
     } catch (RuntimeException e) {
+      log.debug("Token acquisition error: {}", e.toString());
+      return useFallbackOrWarnUnauthenticated(cacheRef);
+    }
+    if (token == null) {
+      return useFallbackOrWarnUnauthenticated(cacheRef);
+    }
+    log.debug("Azure Entra access token acquired successfully.");
+    if (cacheRef != null) {
+      cacheRef.set(token);
+    }
+    sharedFailureState.set(false);
+    return token.getToken();
+  }
+
+  private String useFallbackOrWarnUnauthenticated(AtomicReference<AccessToken> cacheRef) {
+    if (cacheRef != null) {
+      String fallback = cachedTokenIfStillRealValid(cacheRef.get());
+      if (fallback != null) {
+        log.debug("Token refresh failed; serving cached token still valid until its expiry.");
+        return fallback;
+      }
+    }
+    // Both refresh and fallback failed: this request will actually go out unauthenticated.
+    if (sharedFailureState.compareAndSet(false, true)) {
       // The DefaultAzureCredentialBuilder chain in createCredential() tries Azure CLI,
       // environment variables, and Managed Identity in order. Steer the user toward the
-      // most common remediation for each (local dev → `az login`; CI / VM → check env
-      // vars or VM identity assignment) instead of assuming CLI is the only path.
-      if (sharedFailureState.compareAndSet(false, true)) {
-        log.warn(
-            "Failed to acquire Azure access token. Tried Azure CLI, environment variables,"
-                + " and Managed Identity — none succeeded. Try `az login` locally, or check"
-                + " `AZURE_CLIENT_ID` / Managed Identity role assignment on this host."
-                + " Subsequent failures will be suppressed until the next successful refresh.");
-      }
-      log.debug("Token acquisition error: {}", e.toString());
-      return null;
+      // most common remediation for each instead of assuming CLI is the only path.
+      log.warn(
+          "Failed to acquire Azure access token. Tried Azure CLI, environment variables,"
+              + " and Managed Identity — none succeeded. Try `az login` locally, or check"
+              + " `AZURE_CLIENT_ID` / Managed Identity role assignment on this host."
+              + " Subsequent failures will be suppressed until the next successful refresh.");
     }
+    return null;
   }
 }
