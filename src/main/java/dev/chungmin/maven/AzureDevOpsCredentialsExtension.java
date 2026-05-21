@@ -793,7 +793,13 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         // not because it's truly expired). If fallback serves the request, the user is
         // actually authenticated — a WARN saying "request will go out unauthenticated"
         // would be a lie. Only warn when fallback genuinely can't save us.
-        String fallback = graceful401AvoidanceFallback(cached);
+        //
+        // S4: re-read cachedToken.get() here instead of using the local `cached` from the
+        // fast-path miss. A concurrent selector slow path / boot fetch may have populated
+        // a fresher token between our fast-path read and this catch — using the freshest
+        // available cached value matches the boot path's useFallbackOrWarnUnauthenticated
+        // which re-reads cacheRef.get() fresh inside the helper.
+        String fallback = graceful401AvoidanceFallback(cachedToken.get());
         if (fallback != null) {
           return fallback;
         }
@@ -802,8 +808,8 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       }
       if (token == null) {
         // Mono.empty() — SDK returned no token without throwing. Same F1 ordering as the
-        // catch path: try fallback first, only warn when fallback is unavailable.
-        String fallback = graceful401AvoidanceFallback(cached);
+        // catch path; same S4 re-read for the freshest available cached fallback.
+        String fallback = graceful401AvoidanceFallback(cachedToken.get());
         if (fallback != null) {
           return fallback;
         }
@@ -909,25 +915,35 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
             myFuture.completeExceptionally(e);
             throw e;
           } finally {
-            releaseLeadership();
+            // S3 defense-in-depth: compareAndSet(myFuture, null) instead of an unconditional
+            // set(null). The current single-flight invariant guarantees only the leader holds
+            // inFlightToken so an unconditional set is correct today, but a future refactor
+            // that lets a stale reference leak past this finally (an exception path that
+            // bypasses it, a misuse of the test seams) would have CAS catch the mismatch
+            // instead of silently nulling out an unrelated leader's future and breaking
+            // single-flight invisibly. Uncontended CAS is single-digit ns on modern x86 —
+            // same defensive-completeness reasoning as the broadened catch in
+            // installSessionConfig (N5) and the per-call TokenRequestContext factory (N10).
+            inFlightToken.compareAndSet(myFuture, null);
           }
         }
         // Lost the CAS; another thread just installed its own future. Loop to join it.
       }
     }
 
-    // Package-private test seams; production calls flow straight through to the
-    // underlying AtomicReference. See acquireTokenSingleFlight for the rationale.
+    // Package-private test seams for the peek + try-claim AtomicReference operations only;
+    // production calls flow straight through. Release-leadership is inlined into the leader's
+    // finally block (see S3 above) — it must run before peek/tryClaim sees the next attempt,
+    // so a test override would either be racy or just duplicate the inline AtomicReference
+    // call. The lost-CAS coverage test (singleFlightLostCasLoopsAndJoinsWinner) overrides
+    // peekInFlight + tryClaimLeadership; the cache-recheck-after-CAS coverage test
+    // (singleFlightReChecksCacheAfterWinningCAS) overrides tryClaimLeadership only.
     CompletableFuture<AccessToken> peekInFlight() {
       return inFlightToken.get();
     }
 
     boolean tryClaimLeadership(CompletableFuture<AccessToken> myFuture) {
       return inFlightToken.compareAndSet(null, myFuture);
-    }
-
-    void releaseLeadership() {
-      inFlightToken.set(null);
     }
 
     private static AccessToken joinUnwrapped(CompletableFuture<AccessToken> future) {
