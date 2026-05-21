@@ -545,6 +545,35 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
+  @SuppressWarnings("unchecked")
+  public void afterSessionStart_selectorDoesNotPoisonSharedCacheWithNullExpiryToken()
+      throws Exception {
+    // N21: regression catcher for the N15 guard on the boot/selector path
+    // (getAccessToken's `token.getExpiresAt() != null` check). A future refactor that drops
+    // that clause would silently land a null-expiry AccessToken in sharedCachedToken; every
+    // subsequent live-path entrySet() would then see isNearExpiry(cached)==true (null
+    // expiry treated as stale), re-enter the slow path, and re-fork `az` per request — the
+    // M1 regression the N15 guard was added to prevent. The live-path side is covered by
+    // liveBearerHeadersMap_doesNotPoisonCacheWithNullExpiryToken; this is its boot-side
+    // sibling, inspecting the extension's private sharedCachedToken field via reflection.
+    when(mockCredential.getToken(any())).thenReturn(Mono.just(new AccessToken("no-expiry", null)));
+    extension.afterSessionStart(session);
+    AuthenticationSelector selector = repoSession.getAuthenticationSelector();
+
+    // Current request is still served the (degenerate but only available) token.
+    assertNotNull(selector.getAuthentication(adoRemoteRepo("MyFeed")));
+
+    // But the shared cache must stay empty — invariant intact for the next caller.
+    Field cacheField = AzureDevOpsCredentialsExtension.class.getDeclaredField("sharedCachedToken");
+    cacheField.setAccessible(true);
+    java.util.concurrent.atomic.AtomicReference<AccessToken> cache =
+        (java.util.concurrent.atomic.AtomicReference<AccessToken>) cacheField.get(extension);
+    assertNull(
+        "Boot/selector path must not poison sharedCachedToken with a null-expiry token",
+        cache.get());
+  }
+
+  @Test
   public void afterSessionStart_selectorConcurrentCallsCoalesceToOneFetch() throws Exception {
     // N4 coverage: 8 threads call getAuthentication simultaneously. All see an empty cache
     // on the fast path (sharedCachedToken just reset by afterSessionStart), enter the
