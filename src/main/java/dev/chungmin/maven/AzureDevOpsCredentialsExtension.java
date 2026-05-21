@@ -434,6 +434,15 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     }
     try {
       repoSession.setConfigProperty(key, value);
+      // S1: also verify on the public-API success path. The post-install check was added
+      // for the reflective-fallback branch (where Aether's live-view contract is the
+      // load-bearing assumption), but the same silent-no-op failure mode applies here: a
+      // future Maven/Aether or a custom DefaultRepositorySystemSession subclass (mvnd,
+      // an outer extension that wraps the session, a ProfiledRepositorySystemSession
+      // decorator) could make setConfigProperty return normally without the value actually
+      // landing in getConfigProperties(). Mirror the rest of the file's symmetric defensive
+      // posture: one check covers every install code path.
+      verifyConfigInstalled(repoSession.getConfigProperties(), key, value);
       return;
     } catch (IllegalStateException ignored) {
       // Maven 3.x marks the RepositorySystemSession read-only by the time afterProjectsRead
@@ -765,7 +774,14 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       // Fast path: a previously cached token that's still well clear of expiry.
       AccessToken cached = cachedToken.get();
       if (cached != null && !isNearExpiry(cached)) {
-        inFailureState.set(false);
+        // Gated reset: the steady-state value here is already false (the success path at
+        // the bottom of this method already cleared it on the prior slow-path acquire),
+        // so an unconditional set would do a redundant volatile store on the hot path —
+        // once per outbound HTTP request, per feed, across every resolver thread in an
+        // `mvn -T 1C` run. Cheap individually; meaningful in aggregate.
+        if (inFailureState.get()) {
+          inFailureState.set(false);
+        }
         return cached.getToken();
       }
       AccessToken token;
@@ -794,7 +810,11 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         noteFailure("Azure credential returned no token (Mono.empty())", null);
         return null;
       }
-      inFailureState.set(false);
+      // Slow-path success: only flip the gate if it was actually tripped. Same gating
+      // motivation as the fast path, less hot but kept symmetric for clarity.
+      if (inFailureState.get()) {
+        inFailureState.set(false);
+      }
       return token.getToken();
     }
 

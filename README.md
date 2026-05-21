@@ -77,6 +77,7 @@ Java 8 or higher is required.
 
 - Only supports Azure DevOps Services (cloud). Azure DevOps Server (on-premises) is not supported, as it uses custom domains that cannot be auto-detected.
 - Plugins or transports that bypass Aether and read `<server>` passwords directly (e.g. `wagon-http`) see only the boot-time token, which is not refreshed mid-build. Mid-build token refresh covers everything that flows through Aether's `HttpTransporter` — the standard Maven Resolver HTTP layer used by Maven 3.3+ for dependency, plugin, and metadata fetches, and by `mvn deploy` for uploads.
+- Mid-build refresh depends on Maven Resolver's `HttpTransporter` re-reading the `HTTP_HEADERS` Map's `entrySet()` on every request (true through maven-resolver 1.x; verified inline at `LiveBearerHeadersMap`'s Javadoc). If a future Aether version snapshots the headers at construction time instead, the feature will silently fall back to boot-time-only auth — long builds would 401 after token expiry with no error. If you're troubleshooting "tokens aren't refreshing" after a Maven/Aether bump, check the value-type dispatch in `HttpTransporter.commonHeaders()` first.
 
 ## Troubleshooting
 

@@ -681,6 +681,36 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
+  public void liveBearerHeadersMap_fastPathResetsTrippedInFailureStateOnCacheHit() {
+    // N (perf-nit): the fast-path's gated `if (inFailureState.get()) inFailureState.set(false)`
+    // only flips the gate when it's actually tripped (avoids a redundant volatile store on
+    // every per-request hot-path hit). This test pre-trips the gate AND pre-populates the
+    // cache via the 5-arg forTest factory so the next entrySet() exercises the fast path
+    // with a tripped gate — exercising the inFailureState.set(false) line that's otherwise
+    // unreachable under normal flow (the slow-path success path clears the gate before any
+    // subsequent fast-path read).
+    java.util.concurrent.atomic.AtomicBoolean preTrippedGate =
+        new java.util.concurrent.atomic.AtomicBoolean(true);
+    java.util.concurrent.atomic.AtomicReference<AccessToken> preCachedToken =
+        new java.util.concurrent.atomic.AtomicReference<>(
+            new AccessToken("pre-cached", OffsetDateTime.now().plusHours(1)));
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+            mockCredential,
+            mock(org.slf4j.Logger.class),
+            preTrippedGate,
+            new java.util.concurrent.atomic.AtomicReference<>(),
+            preCachedToken);
+
+    assertEquals("Bearer pre-cached", map.entrySet().iterator().next().getValue());
+    assertFalse(
+        "Fast-path hit must reset the inFailureState gate when it was already tripped",
+        preTrippedGate.get());
+    // And no SDK call — the cache hit short-circuited.
+    verify(mockCredential, never()).getToken(any());
+  }
+
+  @Test
   public void liveBearerHeadersMap_refreshesAccessTokenWhenWithinExpiryWindow() {
     // M1 refresh boundary: a cached token within 5 min of expiry is treated as stale and
     // triggers a fresh fetch on the next acquire. Set up the first token at expiry+2min
