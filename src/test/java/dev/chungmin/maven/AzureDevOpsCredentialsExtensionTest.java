@@ -650,6 +650,20 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
+  public void liveBearerHeadersMap_warnsOnceWithinANullTokenRun() {
+    // Mono.empty() on every call: SDK returned no token without throwing. The rate-limiter
+    // must treat this the same as the exception path (the resulting 401 has the same blast
+    // radius).
+    when(mockCredential.getToken(any())).thenReturn(Mono.empty());
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+    assertTrue(map.entrySet().isEmpty());
+    assertTrue(map.entrySet().isEmpty());
+    assertTrue(map.entrySet().isEmpty());
+    verify(mockCredential, times(3)).getToken(any());
+  }
+
+  @Test
   public void liveBearerHeadersMap_rewarnAfterRecovery() {
     // Failure, then success (state reset), then failure again -> should warn twice total.
     when(mockCredential.getToken(any()))

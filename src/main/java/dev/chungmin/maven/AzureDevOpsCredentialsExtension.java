@@ -93,6 +93,13 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // getToken() call from any thread, with no per-call locking. Preserve any user override so
     // someone debugging auth issues with `-Dorg.slf4j.simpleLogger.log.com.azure.identity=debug`
     // still sees the logs.
+    //
+    // Assumption: no earlier core extension creates a com.azure.identity logger before
+    // afterSessionStart fires. afterSessionStart is the earliest extension hook, and Maven
+    // loads .mvn/extensions.xml entries before any of them post events, so this holds for the
+    // current Maven 3.x lifecycle. If a future Maven version moves extension activation later
+    // than first-logger-creation, the property write would be too late and azure-identity ERROR
+    // logs would resurface — at which point the user can set the property via -D or settings.
     if (System.getProperty(AZURE_IDENTITY_LOG_PROPERTY) == null) {
       System.setProperty(AZURE_IDENTITY_LOG_PROPERTY, "off");
     }
@@ -292,8 +299,8 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
 
   private class AzureDevOpsAuthSelector implements AuthenticationSelector {
     private final AuthenticationSelector delegate;
-    private String cachedToken;
-    private boolean tokenAttempted;
+    private volatile String cachedToken;
+    private volatile boolean tokenAttempted;
 
     AzureDevOpsAuthSelector(AuthenticationSelector delegate) {
       this.delegate = delegate;
@@ -310,9 +317,16 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       if (!isAzureDevOpsUrl(repository.getUrl())) {
         return null;
       }
+      // Aether can call selectors from multiple resolver threads concurrently. Without DCL the
+      // shared TokenCredential cache absorbs the redundancy, but we'd still log/attempt two
+      // boot-time getToken() calls — annoying when triaging auth failures from logs.
       if (!tokenAttempted) {
-        cachedToken = getAccessToken(getSharedCredential());
-        tokenAttempted = true;
+        synchronized (this) {
+          if (!tokenAttempted) {
+            cachedToken = getAccessToken(getSharedCredential());
+            tokenAttempted = true;
+          }
+        }
       }
       if (cachedToken == null) {
         return null;
@@ -368,18 +382,25 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
         AccessToken token = credential.getToken(request).block();
         if (token == null) {
+          // Mono.empty() — SDK returned no token without throwing. Same failure mode as the
+          // catch path (request will 401), so go through the same rate-limited warn helper.
+          noteFailure("Azure credential returned no token (Mono.empty())");
           return null;
         }
         inFailureState.set(false);
         return token.getToken();
       } catch (RuntimeException e) {
-        if (inFailureState.compareAndSet(false, true)) {
-          log.warn(
-              "Failed to refresh Azure access token mid-build: {}. Subsequent failures will be"
-                  + " suppressed until the next successful refresh.",
-              e.toString());
-        }
+        noteFailure("Failed to refresh Azure access token mid-build: " + e);
         return null;
+      }
+    }
+
+    private void noteFailure(String reason) {
+      if (inFailureState.compareAndSet(false, true)) {
+        log.warn(
+            "{}. Request will go out unauthenticated; subsequent failures will be suppressed"
+                + " until the next successful refresh.",
+            reason);
       }
     }
   }
