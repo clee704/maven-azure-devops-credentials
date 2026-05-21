@@ -31,7 +31,10 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
@@ -69,6 +72,28 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
 
   @Inject private RepositorySystem repositorySystem;
 
+  // Shared scopes spec for every token acquisition (boot path getAccessToken + live path
+  // LiveBearerHeadersMap.acquireToken). One source of truth; if a future change needs new
+  // scopes / claims / tenant overrides, do it here, not in two near-identical spots.
+  //
+  // Assumption: no credential in the chain (CLI, Environment, ManagedIdentity at time of
+  // writing) mutates the request. TokenRequestContext IS mutable (addScopes / setClaims /
+  // setTenantId / setCaeEnabled), so if a future Azure Identity revision — or a new credential
+  // type added to the chain — calls those during getToken(), this shared instance would be
+  // corrupted JVM-wide. If that day arrives, switch this back to a per-call allocation (the
+  // cost is one short-lived object per HTTP request).
+  private static final TokenRequestContext TOKEN_REQUEST =
+      new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
+
+  // Single point of credential.getToken() invocation. Both the boot path (getAccessToken,
+  // for Settings.Server injection + AzureDevOpsAuthSelector cache) and the live path
+  // (LiveBearerHeadersMap.acquireToken, called per outbound HTTP request from Aether) go
+  // through this. Anything that needs to change about the SDK invocation — telemetry,
+  // retry, scopes, timeout — applies to both automatically.
+  static AccessToken blockForToken(TokenCredential credential) {
+    return credential.getToken(TOKEN_REQUEST).block();
+  }
+
   // Lazily-initialized credential, shared across all three token-consuming code paths:
   // the Aether AuthenticationSelector (afterSessionStart), the LiveBearerHeadersMap entries
   // (afterProjectsRead), and the legacy Server.password injection (afterProjectsRead). Sharing
@@ -105,6 +130,19 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     if (System.getProperty(AZURE_IDENTITY_LOG_PROPERTY) == null) {
       System.setProperty(AZURE_IDENTITY_LOG_PROPERTY, "off");
     }
+    if (!(session.getRepositorySession() instanceof DefaultRepositorySystemSession)) {
+      // mvnd, a future Maven that wraps the resolver session, or a custom Aether transport
+      // could supply a non-default implementation. Skip with a warning instead of throwing
+      // ClassCastException — the boot-path settings injection in afterProjectsRead still
+      // runs, so basic auth still works; only the AzureDevOpsAuthSelector is skipped.
+      log.warn(
+          "RepositorySystemSession is {}, not DefaultRepositorySystemSession; skipping"
+              + " AzureDevOpsAuthSelector installation. Boot-time settings injection is"
+              + " unaffected, but bearer-header injection for transports that ignore"
+              + " settings.xml credentials may not work.",
+          session.getRepositorySession().getClass().getName());
+      return;
+    }
     DefaultRepositorySystemSession repoSession =
         (DefaultRepositorySystemSession) session.getRepositorySession();
     AuthenticationSelector delegate = repoSession.getAuthenticationSelector();
@@ -131,18 +169,40 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // a fresh bearer token from Azure Identity — which internally caches and refreshes the token
     // ~5 minutes before expiry. This eliminates the per-invocation token-staleness window that
     // bites builds longer than the token's lifetime (~60-75 minutes for Entra access tokens).
-    DefaultRepositorySystemSession repoSession =
-        (DefaultRepositorySystemSession) session.getRepositorySession();
     TokenCredential credential = getSharedCredential();
-    // Share one warn-rate-limiter across every per-repo LiveBearerHeadersMap. A credential
-    // outage affects all feeds simultaneously (they share `credential`), so without this we'd
-    // warn N times per outage on a workspace with N ADO feeds.
-    AtomicBoolean sharedFailureState = new AtomicBoolean(false);
-    for (String repoId : repoIds) {
-      installSessionConfig(
-          repoSession,
-          ConfigurationProperties.HTTP_HEADERS + "." + repoId,
-          new LiveBearerHeadersMap(credential, log, sharedFailureState));
+    if (session.getRepositorySession() instanceof DefaultRepositorySystemSession) {
+      DefaultRepositorySystemSession repoSession =
+          (DefaultRepositorySystemSession) session.getRepositorySession();
+      // Share one warn-rate-limiter across every per-repo LiveBearerHeadersMap. A credential
+      // outage affects all feeds simultaneously (they share `credential`), so without this we'd
+      // warn N times per outage on a workspace with N ADO feeds.
+      AtomicBoolean sharedFailureState = new AtomicBoolean(false);
+      // Share one single-flight gate across every per-repo LiveBearerHeadersMap. Aether's
+      // resolver runs N threads (1C-multiplied by `mvn -T`); each entrySet() call would
+      // otherwise race directly into credential.getToken(), and AzureCliCredential forks a
+      // subprocess per call (no built-in cache for CLI tokens). Without this gate, a burst
+      // would fork N `az` processes simultaneously; with it, the first thread fetches and the
+      // rest await the same future. The reference clears immediately after each acquisition,
+      // so the NEXT burst gets a fresh fetch (we don't try to replicate the SDK's expiry
+      // tracking — that's the SDK's job for credentials that support caching).
+      AtomicReference<CompletableFuture<AccessToken>> sharedInFlightToken = new AtomicReference<>();
+      for (String repoId : repoIds) {
+        installSessionConfig(
+            repoSession,
+            ConfigurationProperties.HTTP_HEADERS + "." + repoId,
+            new LiveBearerHeadersMap(credential, log, sharedFailureState, sharedInFlightToken));
+      }
+    } else {
+      // Defensive guard: a custom RepositorySystemSession (mvnd, a future Maven version, or
+      // an outer extension that wraps the session) would otherwise throw ClassCastException
+      // at startup and abort the build for an environment change that has nothing to do with
+      // authentication. Skip live-header injection with a warning; the boot-time
+      // Settings.Server fallback below still runs and covers ~60-75 minutes of build time.
+      log.warn(
+          "RepositorySystemSession is {}, not DefaultRepositorySystemSession; skipping"
+              + " live Authorization header injection. Long builds (>~60min) may fail with"
+              + " HTTP 401 once the boot-time token expires.",
+          session.getRepositorySession().getClass().getName());
     }
 
     // Also do an eager one-shot token acquisition for legacy/fallback paths:
@@ -384,18 +444,6 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
    * commonHeaders()} in the active maven-resolver-transport-http first.
    */
   static class LiveBearerHeadersMap extends AbstractMap<String, String> {
-    // The scopes argument never changes and the SDK only reads from it; reuse one instance
-    // across every per-request acquireToken() call to avoid the per-HTTP-request allocation.
-    //
-    // Assumption: no credential in the chain (CLI, Environment, ManagedIdentity at time of
-    // writing) mutates the request. TokenRequestContext IS mutable (addScopes / setClaims /
-    // setTenantId / setCaeEnabled), so if a future Azure Identity revision — or a new
-    // credential type added to the chain — calls those during getToken(), this shared
-    // instance would be corrupted JVM-wide. If that day arrives, switch this back to a
-    // per-call allocation (the cost is one short-lived object per HTTP request).
-    private static final TokenRequestContext TOKEN_REQUEST =
-        new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
-
     private final TokenCredential credential;
     private final org.slf4j.Logger logger;
     // Rate-limits the per-request failure warning: {@code entrySet()} is called on EVERY
@@ -405,43 +453,63 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // is shared across every per-repo instance constructed in afterProjectsRead so a single
     // outage warns at most once across all feeds, not once per feed.
     private final AtomicBoolean inFailureState;
+    // Single-flight gate: shared across every per-repo instance constructed in
+    // afterProjectsRead so a burst of concurrent entrySet() calls from Aether's resolver
+    // pool coalesces into ONE credential.getToken() invocation. See acquireToken() for the
+    // mechanics; see afterProjectsRead for the rationale (AzureCliCredential has no
+    // built-in cache, so without coalescing N concurrent threads = N concurrent `az` forks).
+    private final AtomicReference<CompletableFuture<AccessToken>> inFlightToken;
 
     LiveBearerHeadersMap(TokenCredential credential) {
-      this(credential, log, new AtomicBoolean(false));
+      this(credential, log, new AtomicBoolean(false), new AtomicReference<>());
     }
 
     // Logger-injection overload exists so unit tests can verify the warn rate-limiter without
     // pulling in an SLF4J test appender dependency. Production callers always use the
-    // single-arg constructor or the three-arg variant that shares the failure-state gate.
+    // single-arg constructor or the four-arg variant that shares both gates.
     LiveBearerHeadersMap(TokenCredential credential, org.slf4j.Logger logger) {
-      this(credential, logger, new AtomicBoolean(false));
+      this(credential, logger, new AtomicBoolean(false), new AtomicReference<>());
     }
 
     LiveBearerHeadersMap(
         TokenCredential credential, org.slf4j.Logger logger, AtomicBoolean sharedFailureState) {
+      this(credential, logger, sharedFailureState, new AtomicReference<>());
+    }
+
+    LiveBearerHeadersMap(
+        TokenCredential credential,
+        org.slf4j.Logger logger,
+        AtomicBoolean sharedFailureState,
+        AtomicReference<CompletableFuture<AccessToken>> sharedInFlightToken) {
       this.credential = credential;
       this.logger = logger;
       this.inFailureState = sharedFailureState;
+      this.inFlightToken = sharedInFlightToken;
     }
 
     @Override
     public Set<Map.Entry<String, String>> entrySet() {
       String token = acquireToken();
-      if (token == null) {
-        // Return no headers; the request will go out unauthenticated and the server will
-        // reply 401, surfacing the failure clearly to the user.
-        return Collections.emptySet();
-      }
-      return Collections.singleton(
-          new AbstractMap.SimpleImmutableEntry<>("Authorization", "Bearer " + token));
+      // Always return exactly one entry so size() and entrySet().size() agree (Map contract).
+      // On token-acquisition failure the value is null; Aether's HttpTransporter.commonHeaders()
+      // calls request.removeHeaders(key) when the value isn't a String, so the request goes out
+      // WITHOUT an Authorization header at all — same wire behavior as the original "return
+      // emptySet on failure" path, but now size() and entrySet().size() agree.
+      String value = token != null ? "Bearer " + token : null;
+      return Collections.singleton(new AbstractMap.SimpleImmutableEntry<>("Authorization", value));
     }
 
-    // Identity semantics for size(), equals(), and hashCode() — same motivation as the
-    // toString() override below. AbstractMap's defaults all call entrySet().iterator() and,
-    // in the case of equals(), materialize the value into a String to compare it against
-    // the other map's get(key) — which means a Bearer JWT can land in arbitrary places
-    // (exception toString quoting its arguments, a framework's debug log, etc.). The map is
-    // never compared by content anywhere in Maven/Aether, so identity is correct.
+    // Meta-pattern: every passive-introspection method on AbstractMap delegates to
+    // entrySet().iterator() (toString formats each entry; equals materializes values to
+    // compare them via .equals; hashCode sums entry hashes; size counts). For our live
+    // map this would (a) trigger a synchronous credential.getToken() — wrong for any
+    // "is this object harmless to log/inspect" caller — and (b) in equals/toString,
+    // materialize a Bearer JWT into a String that lands wherever the caller is dumping
+    // (Maven -X debug, a future framework that toString'd its config, an exception that
+    // quotes its arguments). The map is never compared by content or sized anywhere in
+    // Maven/Aether (commonHeaders() only iterates entrySet()), so identity / fixed-string
+    // semantics are correct and defuse the whole class of "accidental token exposure
+    // via Object method" hazards in one place.
     @Override
     public int size() {
       return 1;
@@ -457,37 +525,87 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       return System.identityHashCode(this);
     }
 
-    // AbstractMap.toString() iterates entrySet() and formats each entry, which would (a) trigger
-    // a synchronous credential.getToken().block() and (b) print the live Bearer JWT to whatever
-    // logged/printed the map (e.g., Maven -X debug output, a future framework that dumps
-    // session config, or an exception toString() that quotes its arguments). Return a fixed
-    // token-free label instead.
     @Override
     public String toString() {
       return "AzureDevOpsLiveAuthHeaders{keys=[Authorization]}";
     }
 
     private String acquireToken() {
-      // Not single-flighted at this layer: under burst load (e.g. parallel resolver pool
-      // crossing the 5-min pre-expiry refresh window) every thread enters credential.getToken()
-      // concurrently. We rely on the Azure Identity SDK's internal token cache to coalesce
-      // these into a single chain walk + N cache hits. If a future SDK or credential chain
-      // change breaks that single-flight, this would degenerate to N parallel `az` subprocess
-      // invocations; adding a synchronized gate here would serialize EVERY per-request entrySet()
-      // call (the common path: cached token, no SDK round-trip), which is a worse trade.
+      AccessToken token;
       try {
-        AccessToken token = credential.getToken(TOKEN_REQUEST).block();
-        if (token == null) {
-          // Mono.empty() — SDK returned no token without throwing. Same failure mode as the
-          // catch path (request will 401), so go through the same rate-limited warn helper.
-          noteFailure("Azure credential returned no token (Mono.empty())", null);
-          return null;
-        }
-        inFailureState.set(false);
-        return token.getToken();
+        token = acquireTokenSingleFlight();
       } catch (RuntimeException e) {
         noteFailure("Failed to refresh Azure access token mid-build", e);
         return null;
+      }
+      if (token == null) {
+        // Mono.empty() — SDK returned no token without throwing. Same failure mode as the
+        // catch path (request will 401), so go through the same rate-limited warn helper.
+        noteFailure("Azure credential returned no token (Mono.empty())", null);
+        return null;
+      }
+      inFailureState.set(false);
+      return token.getToken();
+    }
+
+    // Single-flight via AtomicReference<CompletableFuture>: the FIRST thread into a burst
+    // installs its own future as the in-flight marker, then calls credential.getToken();
+    // every later thread sees the existing future and waits on it. When the leader finishes
+    // (success or failure), it completes the future and clears the reference, so the NEXT
+    // burst starts a fresh fetch — we intentionally do NOT cache the AccessToken across
+    // bursts, leaving expiry tracking to the SDK (or to the next acquire attempt, which is
+    // cheap once the SDK's internal state is warm). The retry loop handles the rare race
+    // where the leader clears the reference between get() and compareAndSet().
+    private AccessToken acquireTokenSingleFlight() {
+      while (true) {
+        CompletableFuture<AccessToken> existing = inFlightToken.get();
+        if (existing != null) {
+          return joinUnwrapped(existing);
+        }
+        CompletableFuture<AccessToken> myFuture = new CompletableFuture<>();
+        if (inFlightToken.compareAndSet(null, myFuture)) {
+          try {
+            AccessToken token = blockForToken(credential);
+            myFuture.complete(token);
+            return token;
+          } catch (RuntimeException e) {
+            // Critical: complete the future exceptionally so waiters joined on it unblock
+            // with the same failure instead of hanging forever. The finally below clears
+            // the in-flight reference; until that runs, every late-arriving waiter still
+            // joins THIS future and sees the same exception.
+            myFuture.completeExceptionally(e);
+            throw e;
+          } catch (Error e) {
+            // Same single-flight visibility guarantee as the RuntimeException branch — if
+            // the SDK or a transitive dependency throws OOM/StackOverflowError, propagate
+            // it to every waiter so the build fails fast and consistently instead of one
+            // thread crashing while the others hang on the never-completed future.
+            myFuture.completeExceptionally(e);
+            throw e;
+          } finally {
+            inFlightToken.set(null);
+          }
+        }
+        // Lost the CAS; another thread just installed its own future. Loop to join it.
+      }
+    }
+
+    private static AccessToken joinUnwrapped(CompletableFuture<AccessToken> future) {
+      try {
+        return future.join();
+      } catch (CompletionException e) {
+        // The SDK only emits RuntimeException via Mono.error(), but the leader's catch above
+        // also propagates Error via completeExceptionally(). Re-throw the original cause so
+        // the type the caller sees matches what they'd have seen calling getToken() directly.
+        if (e.getCause() instanceof RuntimeException) {
+          throw (RuntimeException) e.getCause();
+        }
+        if (e.getCause() instanceof Error) {
+          throw (Error) e.getCause();
+        }
+        // Defensive: only reachable if someone hand-completes the future with a checked
+        // Throwable (Mono.error() can't). Wrap so acquireToken's catch handler can recover.
+        throw new RuntimeException("Single-flight token acquisition failed", e.getCause());
       }
     }
 
@@ -543,8 +661,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   private String getAccessToken(TokenCredential credential) {
     log.debug("Acquiring Azure Entra access token for Azure DevOps...");
     try {
-      TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
-      AccessToken token = credential.getToken(request).block();
+      AccessToken token = blockForToken(credential);
       if (token != null) {
         log.debug("Azure Entra access token acquired successfully.");
         return token.getToken();
