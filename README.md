@@ -48,7 +48,9 @@ The extension detects Azure DevOps feed URLs (`*.pkgs.visualstudio.com` and `pkg
    1. **Azure CLI** (`az login`)
    2. **Environment variables** (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`)
    3. **Managed Identity** (for Azure VMs, App Service, etc.)
-3. Credentials are injected using Maven's own `RepositorySystem.injectAuthentication()` API, the same mechanism Maven uses internally during project building.
+3. Credentials are wired up in two places:
+   - **Aether `HTTP_HEADERS` (primary, mid-build refresh capable)** — the extension installs a live `Map<String,String>` into the Aether session's `aether.connector.http.headers.<repoId>` config. Aether's `HttpTransporter` iterates this map's `entrySet()` on every outbound HTTP request, so each call returns a freshly-acquired Bearer token from the cached `TokenCredential`. When the underlying Entra token is past Azure SDK's refresh window (~5 min before expiry), the SDK transparently re-acquires it. This means **a single Maven invocation can outlive the boot-time token** — verified end-to-end on a 50-minute build whose `verify` phase fired ~12 minutes past the boot token's expiry and resolved artifacts cleanly without 401s.
+   - **`settings.xml` server entry (legacy fallback)** — the extension also injects the boot-time token as a `<server>` password via `RepositorySystem.injectAuthentication()`. This covers Maven code paths that don't go through Aether's `HttpTransporter`. Note: this fallback token is *not* refreshed mid-build.
 
 ## Credential precedence
 
@@ -74,7 +76,7 @@ Java 8 or higher is required.
 ## Limitations
 
 - Only supports Azure DevOps Services (cloud). Azure DevOps Server (on-premises) is not supported, as it uses custom domains that cannot be auto-detected.
-- Tokens are acquired once per Maven invocation and not refreshed. This matches Maven's own behavior for credentials in `settings.xml`, which are also read once at startup, so the extension imposes no additional limit over a static `settings.xml`. Builds whose token-using HTTP requests outlive a single Azure Entra access token (~1 hour from issue) will fail regardless of credential source; truly mid-invocation refresh would require a custom Aether `Authentication` with per-request `fill()`.
+- Token refresh applies only to artifact downloads that flow through Aether's `HttpTransporter` (the standard Maven Resolver HTTP layer used by Maven 3.3+ for all dependency, plugin, and metadata fetches). Older HTTP transports (e.g. the legacy `wagon-http`) or third-party plugins that bypass Aether and read `<server>` passwords directly will still see only the boot-time token.
 
 ## Troubleshooting
 

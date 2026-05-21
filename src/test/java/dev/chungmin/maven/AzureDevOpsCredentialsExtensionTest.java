@@ -484,6 +484,127 @@ public class AzureDevOpsCredentialsExtensionTest {
     verify(mockCredential, times(1)).getToken(any());
   }
 
+  // === LiveBearerHeadersMap ===
+
+  @Test
+  public void liveBearerHeadersMap_returnsAuthorizationHeader() {
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("token-A", OffsetDateTime.now().plusHours(1))));
+
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        extension.new LiveBearerHeadersMap(mockCredential);
+
+    assertEquals(1, map.entrySet().size());
+    java.util.Map.Entry<String, String> entry = map.entrySet().iterator().next();
+    assertEquals("Authorization", entry.getKey());
+    assertEquals("Bearer token-A", entry.getValue());
+  }
+
+  @Test
+  public void liveBearerHeadersMap_refreshesOnEachEntrySetCall() {
+    // This is the core property: HttpTransporter.commonHeaders() iterates entrySet() on every
+    // outgoing request, and we MUST return the current token each time, not a baked one.
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("token-1", OffsetDateTime.now().plusHours(1))))
+        .thenReturn(Mono.just(new AccessToken("token-2", OffsetDateTime.now().plusHours(1))))
+        .thenReturn(Mono.just(new AccessToken("token-3", OffsetDateTime.now().plusHours(1))));
+
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        extension.new LiveBearerHeadersMap(mockCredential);
+
+    assertEquals("Bearer token-1", map.entrySet().iterator().next().getValue());
+    assertEquals("Bearer token-2", map.entrySet().iterator().next().getValue());
+    assertEquals("Bearer token-3", map.entrySet().iterator().next().getValue());
+    verify(mockCredential, times(3)).getToken(any());
+  }
+
+  @Test
+  public void liveBearerHeadersMap_returnsEmptyOnNullToken() {
+    when(mockCredential.getToken(any())).thenReturn(Mono.empty());
+
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        extension.new LiveBearerHeadersMap(mockCredential);
+
+    assertTrue(map.entrySet().isEmpty());
+  }
+
+  @Test
+  public void liveBearerHeadersMap_returnsEmptyOnException() {
+    when(mockCredential.getToken(any())).thenThrow(new RuntimeException("auth failed"));
+
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        extension.new LiveBearerHeadersMap(mockCredential);
+
+    assertTrue(map.entrySet().isEmpty());
+  }
+
+  @Test
+  public void liveBearerHeadersMap_restoresLogPropertyWhenPreviouslySet() {
+    String prop = "org.slf4j.simpleLogger.log.com.azure.identity";
+    System.setProperty(prop, "debug");
+    try {
+      when(mockCredential.getToken(any()))
+          .thenReturn(Mono.just(new AccessToken("t", OffsetDateTime.now().plusHours(1))));
+
+      AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+          extension.new LiveBearerHeadersMap(mockCredential);
+      map.entrySet();
+
+      assertEquals("debug", System.getProperty(prop));
+    } finally {
+      System.clearProperty(prop);
+    }
+  }
+
+  @Test
+  public void afterProjectsRead_installsLiveHttpHeadersConfig() throws MavenExecutionException {
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(project.getRemoteArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(project.getPluginArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
+
+    extension.afterProjectsRead(session);
+
+    Object headers = repoSession.getConfigProperties().get("aether.connector.http.headers.MyFeed");
+    assertNotNull("HTTP_HEADERS config must be installed for the ADO repo", headers);
+    assertTrue("HTTP_HEADERS value must be a Map", headers instanceof java.util.Map);
+    java.util.Map<?, ?> headerMap = (java.util.Map<?, ?>) headers;
+    java.util.Map.Entry<?, ?> entry = headerMap.entrySet().iterator().next();
+    assertEquals("Authorization", entry.getKey());
+    assertTrue(entry.getValue().toString().startsWith("Bearer "));
+  }
+
+  @Test
+  public void installSessionConfig_writableSession() {
+    DefaultRepositorySystemSession s = new DefaultRepositorySystemSession();
+    AzureDevOpsCredentialsExtension.installSessionConfig(s, "k1", "v1");
+    assertEquals("v1", s.getConfigProperties().get("k1"));
+  }
+
+  @Test
+  public void installSessionConfig_readOnlySession_usesReflectionFallback() {
+    DefaultRepositorySystemSession s = new DefaultRepositorySystemSession();
+    s.setReadOnly();
+    try {
+      s.setConfigProperty("rejected", "value");
+      fail("Expected IllegalStateException on read-only session");
+    } catch (IllegalStateException expected) {
+      /* expected */
+    }
+    AzureDevOpsCredentialsExtension.installSessionConfig(s, "k2", "v2");
+    assertEquals("v2", s.getConfigProperties().get("k2"));
+  }
+
+  @Test
+  public void installSessionConfig_reflectionFailure_swallowsAndLogs() {
+    DefaultRepositorySystemSession s = new DefaultRepositorySystemSession();
+    s.setReadOnly();
+    // Object.class has no "configProperties" field -> NoSuchFieldException -> caught and logged.
+    AzureDevOpsCredentialsExtension.installSessionConfig(s, "k3", "v3", Object.class);
+    assertFalse(s.getConfigProperties().containsKey("k3"));
+  }
+
   // === helpers ===
 
   private AzureDevOpsCredentialsExtension extensionWith(TokenCredential credential)

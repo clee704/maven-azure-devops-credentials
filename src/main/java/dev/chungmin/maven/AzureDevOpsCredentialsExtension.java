@@ -24,9 +24,12 @@ import com.azure.identity.EnvironmentCredentialBuilder;
 import com.azure.identity.ManagedIdentityCredentialBuilder;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.AbstractMap;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import javax.inject.Inject;
 import javax.inject.Named;
@@ -39,6 +42,7 @@ import org.apache.maven.project.MavenProject;
 import org.apache.maven.repository.RepositorySystem;
 import org.apache.maven.settings.Server;
 import org.apache.maven.settings.Settings;
+import org.eclipse.aether.ConfigurationProperties;
 import org.eclipse.aether.DefaultRepositorySystemSession;
 import org.eclipse.aether.repository.Authentication;
 import org.eclipse.aether.repository.AuthenticationSelector;
@@ -87,9 +91,32 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       return;
     }
 
+    // Install a per-repo live Authorization header on the Aether session. The Map's entrySet()
+    // is invoked on every HTTP request by HttpTransporter.commonHeaders(), so each request gets
+    // a fresh bearer token from Azure Identity — which internally caches and refreshes the token
+    // ~5 minutes before expiry. This eliminates the per-invocation token-staleness window that
+    // bites builds longer than the token's lifetime (~70 minutes for Entra access tokens).
+    DefaultRepositorySystemSession repoSession =
+        (DefaultRepositorySystemSession) session.getRepositorySession();
+    TokenCredential sharedCredential = createCredential();
+    for (String repoId : repoIds) {
+      installSessionConfig(
+          repoSession,
+          ConfigurationProperties.HTTP_HEADERS + "." + repoId,
+          new LiveBearerHeadersMap(sharedCredential));
+    }
+
+    // Also do an eager one-shot token acquisition for legacy/fallback paths:
+    //   - the Settings.Server entries below (used by Maven Wagon and other non-Aether
+    //     transports that ignore aether.connector.http.headers.* config)
+    //   - any early Aether call that happens before commonHeaders() runs
+    // The HTTP_HEADERS live Map above takes precedence for Aether HTTP transport and is what
+    // makes long builds work; this static token only matters for the edge cases.
     String token = getAccessToken();
     if (token == null) {
-      log.warn("Failed to acquire Azure access token. Azure DevOps feeds may not be accessible.");
+      log.warn(
+          "Failed to acquire initial Azure access token. Live header refresh will retry per request, "
+              + "but legacy/Wagon paths may not be authenticated.");
       return;
     }
 
@@ -137,6 +164,38 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         repoIds.add(repo.getId());
         log.debug("Found Azure DevOps feed '{}' at {}.", repo.getId(), repo.getUrl());
       }
+    }
+  }
+
+  /**
+   * Install a key/value into the Aether session's config properties, working around the read-only
+   * lock that Maven applies to the session before {@code afterProjectsRead} fires. We try the
+   * public API first; if that throws {@link IllegalStateException}, we mutate the underlying {@code
+   * HashMap} directly via reflection — the {@code Collections.unmodifiableMap} view that Aether
+   * exposes is a live view over the same map, so consumers see the new entry.
+   */
+  @SuppressWarnings("unchecked")
+  static void installSessionConfig(
+      DefaultRepositorySystemSession repoSession, String key, Object value) {
+    installSessionConfig(repoSession, key, value, DefaultRepositorySystemSession.class);
+  }
+
+  @SuppressWarnings("unchecked")
+  static void installSessionConfig(
+      DefaultRepositorySystemSession repoSession, String key, Object value, Class<?> targetClass) {
+    try {
+      repoSession.setConfigProperty(key, value);
+      return;
+    } catch (IllegalStateException notWritable) {
+      // Maven 3.x marks the RepositorySystemSession read-only by the time afterProjectsRead
+      // fires; fall through to the reflective write.
+    }
+    try {
+      java.lang.reflect.Field f = targetClass.getDeclaredField("configProperties");
+      f.setAccessible(true);
+      ((java.util.Map<String, Object>) f.get(repoSession)).put(key, value);
+    } catch (ReflectiveOperationException e) {
+      log.warn("Failed to install Aether session config '{}': {}", key, e.toString());
     }
   }
 
@@ -208,6 +267,55 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         return null;
       }
       return new AuthenticationBuilder().addUsername("azure").addPassword(cachedToken).build();
+    }
+  }
+
+  /**
+   * Live Map whose {@link #entrySet()} returns a fresh {@code Authorization: Bearer <token>} entry
+   * on every iteration. Installed into the Aether session under {@code
+   * aether.connector.http.headers.<repoId>}; the Aether HTTP transporter iterates this map's entry
+   * set on every outgoing HTTP request, so each request picks up the current bearer token directly
+   * from Azure Identity (which caches the token internally and refreshes ~5 minutes before expiry).
+   * This allows a single Maven invocation to keep authenticating against an Azure DevOps Maven feed
+   * indefinitely, even past the original token's expiry — which would otherwise break builds longer
+   * than the token lifetime (~70 minutes for Entra access tokens).
+   */
+  class LiveBearerHeadersMap extends AbstractMap<String, String> {
+    private final TokenCredential credential;
+
+    LiveBearerHeadersMap(TokenCredential credential) {
+      this.credential = credential;
+    }
+
+    @Override
+    public Set<Map.Entry<String, String>> entrySet() {
+      String token = acquireToken();
+      if (token == null) {
+        // Return no headers; the request will go out unauthenticated and the server will
+        // reply 401, surfacing the failure clearly to the user.
+        return Collections.emptySet();
+      }
+      return Collections.singleton(
+          new AbstractMap.SimpleImmutableEntry<>("Authorization", "Bearer " + token));
+    }
+
+    private String acquireToken() {
+      String previousLevel = System.getProperty(AZURE_IDENTITY_LOG_PROPERTY);
+      System.setProperty(AZURE_IDENTITY_LOG_PROPERTY, "off");
+      try {
+        TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
+        AccessToken token = credential.getToken(request).block();
+        return token == null ? null : token.getToken();
+      } catch (RuntimeException e) {
+        log.warn("Failed to refresh Azure access token mid-build: {}", e.toString());
+        return null;
+      } finally {
+        if (previousLevel != null) {
+          System.setProperty(AZURE_IDENTITY_LOG_PROPERTY, previousLevel);
+        } else {
+          System.clearProperty(AZURE_IDENTITY_LOG_PROPERTY);
+        }
+      }
     }
   }
 
