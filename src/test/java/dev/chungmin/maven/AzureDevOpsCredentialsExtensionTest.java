@@ -539,17 +539,25 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
-  public void liveBearerHeadersMap_restoresLogPropertyWhenPreviouslySet() {
+  public void afterSessionStart_suppressesAzureIdentityLogByDefault()
+      throws MavenExecutionException {
+    String prop = "org.slf4j.simpleLogger.log.com.azure.identity";
+    System.clearProperty(prop);
+    try {
+      extension.afterSessionStart(session);
+      assertEquals("off", System.getProperty(prop));
+    } finally {
+      System.clearProperty(prop);
+    }
+  }
+
+  @Test
+  public void afterSessionStart_preservesUserAzureIdentityLogOverride()
+      throws MavenExecutionException {
     String prop = "org.slf4j.simpleLogger.log.com.azure.identity";
     System.setProperty(prop, "debug");
     try {
-      when(mockCredential.getToken(any()))
-          .thenReturn(Mono.just(new AccessToken("t", OffsetDateTime.now().plusHours(1))));
-
-      AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-          extension.new LiveBearerHeadersMap(mockCredential);
-      map.entrySet();
-
+      extension.afterSessionStart(session);
       assertEquals("debug", System.getProperty(prop));
     } finally {
       System.clearProperty(prop);

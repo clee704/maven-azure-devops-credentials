@@ -70,6 +70,15 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
 
   @Override
   public void afterSessionStart(MavenSession session) throws MavenExecutionException {
+    // Suppress noisy [ERROR] messages from ChainedTokenCredential trying each credential provider
+    // in turn. SLF4J SimpleLogger (Maven's default binding) reads this property when the
+    // com.azure.identity logger is first created, so setting it once here covers every later
+    // getToken() call from any thread, with no per-call locking. Preserve any user override so
+    // someone debugging auth issues with `-Dorg.slf4j.simpleLogger.log.com.azure.identity=debug`
+    // still sees the logs.
+    if (System.getProperty(AZURE_IDENTITY_LOG_PROPERTY) == null) {
+      System.setProperty(AZURE_IDENTITY_LOG_PROPERTY, "off");
+    }
     DefaultRepositorySystemSession repoSession =
         (DefaultRepositorySystemSession) session.getRepositorySession();
     AuthenticationSelector delegate = repoSession.getAuthenticationSelector();
@@ -109,9 +118,11 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // Also do an eager one-shot token acquisition for legacy/fallback paths:
     //   - the Settings.Server entries below (used by Maven Wagon and other non-Aether
     //     transports that ignore aether.connector.http.headers.* config)
-    //   - any early Aether call that happens before commonHeaders() runs
-    // The HTTP_HEADERS live Map above takes precedence for Aether HTTP transport and is what
-    // makes long builds work; this static token only matters for the edge cases.
+    //   - the AzureDevOpsAuthSelector installed in afterSessionStart, which is what serves
+    //     auth to Aether transports that pre-date HTTP_HEADERS support
+    // The HTTP_HEADERS live Map above takes precedence for modern Aether HTTP transport and is
+    // what makes long builds work; this static token only covers the legacy edges and is NOT
+    // refreshed mid-build.
     String token = getAccessToken();
     if (token == null) {
       log.warn(
@@ -195,7 +206,12 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       f.setAccessible(true);
       ((java.util.Map<String, Object>) f.get(repoSession)).put(key, value);
     } catch (ReflectiveOperationException e) {
-      log.warn("Failed to install Aether session config '{}': {}", key, e.toString());
+      log.error(
+          "Could not install live Authorization header for '{}'; mid-build token refresh is"
+              + " disabled and `mvn` invocations longer than the Entra token TTL (~75 minutes)"
+              + " will fail with HTTP 401. Cause: {}",
+          key,
+          e.toString());
     }
   }
 
@@ -300,8 +316,6 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     }
 
     private String acquireToken() {
-      String previousLevel = System.getProperty(AZURE_IDENTITY_LOG_PROPERTY);
-      System.setProperty(AZURE_IDENTITY_LOG_PROPERTY, "off");
       try {
         TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
         AccessToken token = credential.getToken(request).block();
@@ -309,12 +323,6 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       } catch (RuntimeException e) {
         log.warn("Failed to refresh Azure access token mid-build: {}", e.toString());
         return null;
-      } finally {
-        if (previousLevel != null) {
-          System.setProperty(AZURE_IDENTITY_LOG_PROPERTY, previousLevel);
-        } else {
-          System.clearProperty(AZURE_IDENTITY_LOG_PROPERTY);
-        }
       }
     }
   }
@@ -345,14 +353,6 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
 
   private String getAccessToken() {
     log.debug("Acquiring Azure Entra access token for Azure DevOps...");
-    // Suppress Azure Identity logging during token acquisition. The ChainedTokenCredential
-    // tries multiple credential providers in sequence (Azure CLI, Environment, Managed Identity)
-    // and logs [ERROR] for each provider that fails. These are expected failures — not all
-    // providers are available in all environments. In Maven, SLF4J routes to System.out, so
-    // these errors can pollute stdout and break tools that capture Maven's stdout output
-    // (e.g., CMake's execute_process with mvn help:evaluate -DforceStdout).
-    String previousLevel = System.getProperty(AZURE_IDENTITY_LOG_PROPERTY);
-    System.setProperty(AZURE_IDENTITY_LOG_PROPERTY, "off");
     try {
       TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
       TokenCredential credential = createCredential();
@@ -368,12 +368,6 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       log.warn("Failed to acquire Azure access token. Did you forget to run 'az login'?");
       log.debug("Token acquisition error: {}", e.toString());
       return null;
-    } finally {
-      if (previousLevel != null) {
-        System.setProperty(AZURE_IDENTITY_LOG_PROPERTY, previousLevel);
-      } else {
-        System.clearProperty(AZURE_IDENTITY_LOG_PROPERTY);
-      }
     }
   }
 }
