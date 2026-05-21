@@ -30,7 +30,9 @@ import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
@@ -67,6 +69,21 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       "org.slf4j.simpleLogger.log.com.azure.identity";
 
   @Inject private RepositorySystem repositorySystem;
+
+  // Lazily-initialized credential, shared across all three token-consuming code paths:
+  // the Aether AuthenticationSelector (afterSessionStart), the LiveBearerHeadersMap entries
+  // (afterProjectsRead), and the legacy Server.password injection (afterProjectsRead). Sharing
+  // a single TokenCredential means all paths hit the same internal Azure SDK cache, so the
+  // first hit triggers one chain walk and every subsequent caller — including mid-build
+  // refreshes — gets the cached, transparently-renewed token.
+  private volatile TokenCredential sharedCredential;
+
+  synchronized TokenCredential getSharedCredential() {
+    if (sharedCredential == null) {
+      sharedCredential = createCredential();
+    }
+    return sharedCredential;
+  }
 
   @Override
   public void afterSessionStart(MavenSession session) throws MavenExecutionException {
@@ -107,12 +124,12 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // bites builds longer than the token's lifetime (~60-75 minutes for Entra access tokens).
     DefaultRepositorySystemSession repoSession =
         (DefaultRepositorySystemSession) session.getRepositorySession();
-    TokenCredential sharedCredential = createCredential();
+    TokenCredential credential = getSharedCredential();
     for (String repoId : repoIds) {
       installSessionConfig(
           repoSession,
           ConfigurationProperties.HTTP_HEADERS + "." + repoId,
-          new LiveBearerHeadersMap(sharedCredential));
+          new LiveBearerHeadersMap(credential));
     }
 
     // Also do an eager one-shot token acquisition for legacy/fallback paths:
@@ -125,7 +142,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // The HTTP_HEADERS live Map above takes precedence for modern Aether HTTP transport and is
     // what makes long builds work; this static token only covers the legacy edges and is NOT
     // refreshed mid-build.
-    String token = getAccessToken(sharedCredential);
+    String token = getAccessToken(credential);
     if (token == null) {
       log.warn(
           "Failed to acquire initial Azure access token. Live header refresh will retry per request, "
@@ -199,7 +216,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     try {
       repoSession.setConfigProperty(key, value);
       return;
-    } catch (IllegalStateException notWritable) {
+    } catch (IllegalStateException ignored) {
       // Maven 3.x marks the RepositorySystemSession read-only by the time afterProjectsRead
       // fires; fall through to the reflective write.
     }
@@ -214,6 +231,22 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
               + " (~60-75 minutes) will fail with HTTP 401. Cause: {}",
           key,
           e.toString());
+      return;
+    }
+    // Defensive verification: confirm the reflective write is visible through Aether's public
+    // config-properties view. If a future Aether version changes the live-view contract (e.g.
+    // snapshots configProperties at session-construction time), our reflective write would
+    // silently no-op and the build would 401 ~75 min later with no actionable signal.
+    verifyConfigInstalled(repoSession.getConfigProperties(), key, value);
+  }
+
+  static void verifyConfigInstalled(
+      java.util.Map<String, Object> configPropertiesView, String key, Object value) {
+    if (!Objects.equals(configPropertiesView.get(key), value)) {
+      log.error(
+          "Reflective install of '{}' completed but value is not visible via"
+              + " getConfigProperties(); mid-build token refresh may not take effect.",
+          key);
     }
   }
 
@@ -278,7 +311,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         return null;
       }
       if (!tokenAttempted) {
-        cachedToken = getAccessToken(createCredential());
+        cachedToken = getAccessToken(getSharedCredential());
         tokenAttempted = true;
       }
       if (cachedToken == null) {
@@ -297,9 +330,22 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
    * This allows a single Maven invocation to keep authenticating against an Azure DevOps Maven feed
    * indefinitely, even past the original token's expiry — which would otherwise break builds longer
    * than the token lifetime (~60-75 minutes for Entra access tokens).
+   *
+   * <p><b>Load-bearing assumption:</b> this whole mechanism rests on the maven-resolver-transport
+   * implementation re-iterating the configured {@code HTTP_HEADERS} Map's {@code entrySet()} on
+   * every request, rather than snapshotting it at constructor time. This is true through
+   * maven-resolver 1.x ({@code HttpTransporter.commonHeaders()}); if a future Aether version
+   * changes that contract the feature will silently revert to boot-time-only auth (no exception,
+   * just 401s after token expiry). When debugging "tokens aren't refreshing" reports, check {@code
+   * commonHeaders()} in the active maven-resolver-transport-http first.
    */
   static class LiveBearerHeadersMap extends AbstractMap<String, String> {
     private final TokenCredential credential;
+    // Rate-limits the per-request failure warning: {@code entrySet()} is called on EVERY
+    // outbound HTTP request, so a sustained credential outage during a 1000-artifact resolve
+    // would otherwise drown the log in 1000 identical warnings before the user sees the 401.
+    // Log on transition into the failure state; silently reset on the next success.
+    private final AtomicBoolean inFailureState = new AtomicBoolean(false);
 
     LiveBearerHeadersMap(TokenCredential credential) {
       this.credential = credential;
@@ -321,9 +367,18 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       try {
         TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
         AccessToken token = credential.getToken(request).block();
-        return token == null ? null : token.getToken();
+        if (token == null) {
+          return null;
+        }
+        inFailureState.set(false);
+        return token.getToken();
       } catch (RuntimeException e) {
-        log.warn("Failed to refresh Azure access token mid-build: {}", e.toString());
+        if (inFailureState.compareAndSet(false, true)) {
+          log.warn(
+              "Failed to refresh Azure access token mid-build: {}. Subsequent failures will be"
+                  + " suppressed until the next successful refresh.",
+              e.toString());
+        }
         return null;
       }
     }

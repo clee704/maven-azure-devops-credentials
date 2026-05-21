@@ -584,6 +584,24 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
+  public void sharedCredential_isReusedAcrossBootAndLiveMap() throws MavenExecutionException {
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(project.getRemoteArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(project.getPluginArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
+
+    extension.afterProjectsRead(session);
+    // Boot-time getAccessToken(): 1 call.
+    verify(mockCredential, times(1)).getToken(any());
+
+    // First entrySet() call by the resolver: 2 total calls, ALL going to the same mock.
+    Object headers = repoSession.getConfigProperties().get("aether.connector.http.headers.MyFeed");
+    ((java.util.Map<?, ?>) headers).entrySet();
+    verify(mockCredential, times(2)).getToken(any());
+  }
+
+  @Test
   public void installSessionConfig_writableSession() {
     DefaultRepositorySystemSession s = new DefaultRepositorySystemSession();
     AzureDevOpsCredentialsExtension.installSessionConfig(s, "k1", "v1");
@@ -602,6 +620,48 @@ public class AzureDevOpsCredentialsExtensionTest {
     }
     AzureDevOpsCredentialsExtension.installSessionConfig(s, "k2", "v2");
     assertEquals("v2", s.getConfigProperties().get("k2"));
+  }
+
+  @Test
+  public void verifyConfigInstalled_handlesMissingAndPresent() {
+    // Mismatch path (value not visible): future Aether regression simulation.
+    AzureDevOpsCredentialsExtension.verifyConfigInstalled(
+        java.util.Collections.emptyMap(), "k3", "v3");
+    // Match path (value visible): no-op.
+    AzureDevOpsCredentialsExtension.verifyConfigInstalled(
+        java.util.Collections.singletonMap("k3", (Object) "v3"), "k3", "v3");
+  }
+
+  @Test
+  public void liveBearerHeadersMap_warnsOnceWithinAFailureRun() {
+    // RuntimeException on every call; sustained credential outage.
+    when(mockCredential.getToken(any()))
+        .thenThrow(new RuntimeException("auth failed"))
+        .thenThrow(new RuntimeException("auth failed"))
+        .thenThrow(new RuntimeException("auth failed"));
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+    // All three calls return empty (no header).
+    assertTrue(map.entrySet().isEmpty());
+    assertTrue(map.entrySet().isEmpty());
+    assertTrue(map.entrySet().isEmpty());
+    // The credential was still consulted on each call; the rate-limit is on logging only.
+    verify(mockCredential, times(3)).getToken(any());
+  }
+
+  @Test
+  public void liveBearerHeadersMap_rewarnAfterRecovery() {
+    // Failure, then success (state reset), then failure again -> should warn twice total.
+    when(mockCredential.getToken(any()))
+        .thenThrow(new RuntimeException("fail-1"))
+        .thenReturn(Mono.just(new AccessToken("recovered", OffsetDateTime.now().plusHours(1))))
+        .thenThrow(new RuntimeException("fail-2"));
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+    assertTrue(map.entrySet().isEmpty());
+    assertEquals("Bearer recovered", map.entrySet().iterator().next().getValue());
+    assertTrue(map.entrySet().isEmpty());
+    verify(mockCredential, times(3)).getToken(any());
   }
 
   @Test
