@@ -521,6 +521,30 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
+  public void afterSessionStart_selectorFallsBackToStillRealValidCachedTokenOnRefreshFailure()
+      throws MavenExecutionException {
+    // N6 selector path: when the cached token is in the refresh window (near-expiry) and
+    // the slow-path fetch returns null (Mono.empty), the selector falls back to the
+    // still-real-valid cached token instead of returning null. Mirrors the live-headers
+    // path fallback so users don't see a 401 during a transient credential blip just
+    // because they hit the 5-min refresh window.
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("near-expiry", OffsetDateTime.now().plusMinutes(2))))
+        .thenReturn(Mono.empty());
+
+    extension.afterSessionStart(session);
+    AuthenticationSelector selector = repoSession.getAuthenticationSelector();
+    // First call: cache empty, slow-path fetch returns near-expiry, cache it, return auth.
+    assertNotNull(selector.getAuthentication(adoRemoteRepo("MyFeed")));
+    // Second call: cache near-expiry, slow-path fetch returns null. WITHOUT N6 fallback this
+    // would return null (the build sees 401); WITH it, we serve the still-real-valid cached
+    // token.
+    assertNotNull(
+        "Selector must fall back to cached near-expiry token when refresh fails",
+        selector.getAuthentication(adoRemoteRepo("MyFeed")));
+  }
+
+  @Test
   public void afterSessionStart_selectorConcurrentCallsCoalesceToOneFetch() throws Exception {
     // N4 coverage: 8 threads call getAuthentication simultaneously. All see an empty cache
     // on the fast path (sharedCachedToken just reset by afterSessionStart), enter the
@@ -647,6 +671,64 @@ public class AzureDevOpsCredentialsExtensionTest {
     // Third call: cache has fresh-token (1h expiry), isNearExpiry returns false, cache hit.
     assertEquals("Bearer fresh-token", map.entrySet().iterator().next().getValue());
     verify(mockCredential, times(2)).getToken(any());
+  }
+
+  @Test
+  public void liveBearerHeadersMap_fallsBackToStillRealValidCachedTokenOnRefreshException() {
+    // N6: when a cached token is in the refresh window (near-expiry) and the slow-path
+    // fetch throws, the cached token still has real validity left (just within the 5-min
+    // proactive-refresh window, not actually expired). Serve it instead of returning null
+    // and forcing a 401 during a transient credential blip. Mirrors the Azure Identity
+    // SDK's own "refresh proactively but keep serving the previously-cached token until
+    // actual expiry if refresh fails" philosophy.
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("near-expiry", OffsetDateTime.now().plusMinutes(2))))
+        .thenThrow(new RuntimeException("transient-az-blip"))
+        .thenReturn(Mono.just(new AccessToken("fresh-token", OffsetDateTime.now().plusHours(1))));
+
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+
+    // First call: cache empty, fetch near-expiry, return it. (1 getToken)
+    assertEquals("Bearer near-expiry", map.entrySet().iterator().next().getValue());
+    // Second call: cache has near-expiry, refetch THROWS — fallback returns cached. (2 getToken)
+    assertEquals("Bearer near-expiry", map.entrySet().iterator().next().getValue());
+    // Third call: cache still has near-expiry, refetch succeeds, return fresh-token. (3 getToken)
+    assertEquals("Bearer fresh-token", map.entrySet().iterator().next().getValue());
+    verify(mockCredential, times(3)).getToken(any());
+  }
+
+  @Test
+  public void liveBearerHeadersMap_fallsBackToStillRealValidCachedTokenOnRefreshNullResult() {
+    // N6 (Mono.empty path): same fallback semantics as the exception path.
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("near-expiry", OffsetDateTime.now().plusMinutes(2))))
+        .thenReturn(Mono.empty());
+
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+
+    assertEquals("Bearer near-expiry", map.entrySet().iterator().next().getValue());
+    assertEquals("Bearer near-expiry", map.entrySet().iterator().next().getValue());
+  }
+
+  @Test
+  public void liveBearerHeadersMap_doesNotFallBackToTrulyExpiredCachedToken() {
+    // N6 boundary: a cached token whose REAL expiry is in the past must NOT be served as a
+    // fallback. The graceful-degradation only applies within the 5-min proactive-refresh
+    // window, not after actual expiry.
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("expired", OffsetDateTime.now().minusMinutes(1))))
+        .thenThrow(new RuntimeException("transient-az-blip"));
+
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential);
+
+    // First call: cache empty, fetch returns already-expired token (cache it anyway).
+    assertEquals("Bearer expired", map.entrySet().iterator().next().getValue());
+    // Second call: cache has expired token, refetch THROWS — fallback CANNOT use the cached
+    // value because it's truly expired (expiresAt < now). Returns null.
+    assertNull(map.entrySet().iterator().next().getValue());
   }
 
   @Test
@@ -892,6 +974,9 @@ public class AzureDevOpsCredentialsExtensionTest {
     // second warn would never fire because the failure path isn't reached. Near-expiry
     // (2-min remaining) is treated as stale by isNearExpiry, so the third call re-enters the
     // slow path and re-exercises the failure handler.
+    // N6 caveat: the third call falls back to the cached near-expiry token (still real-valid
+    // for 2 more minutes) instead of returning null. The rate-limiter still fires the warn
+    // edge — the fallback is graceful degradation, not a recovery.
     when(mockCredential.getToken(any()))
         .thenThrow(new RuntimeException("fail-1"))
         .thenReturn(Mono.just(new AccessToken("recovered", OffsetDateTime.now().plusMinutes(2))))
@@ -901,9 +986,12 @@ public class AzureDevOpsCredentialsExtensionTest {
         new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential, mockLog);
     assertNull(map.entrySet().iterator().next().getValue());
     assertEquals("Bearer recovered", map.entrySet().iterator().next().getValue());
-    assertNull(map.entrySet().iterator().next().getValue());
+    // Third call: refresh fails but the cached "recovered" token still has real validity, so
+    // N6 fallback returns it instead of null.
+    assertEquals("Bearer recovered", map.entrySet().iterator().next().getValue());
     verify(mockCredential, times(3)).getToken(any());
     // Two warns total: one per fail edge, with the success in between re-arming the gate.
+    // Fallback doesn't suppress the warn — refresh genuinely failed.
     verify(mockLog, times(2)).warn(anyString(), anyString(), any(Throwable.class));
   }
 
@@ -957,6 +1045,31 @@ public class AzureDevOpsCredentialsExtensionTest {
     // debugging; it must NOT include the values.
     assertFalse("toString must not contain JWT-shaped payload", s.contains("eyJ"));
     verify(mockCredential, never()).getToken(any());
+  }
+
+  @Test
+  public void installSessionConfig_swallowsRuntimeExceptionFromReflectiveFallback() {
+    // N5: setAccessible(true) + Field.get() + Map.put() can throw RuntimeExceptions outside
+    // the ReflectiveOperationException hierarchy — InaccessibleObjectException (JPMS),
+    // SecurityException, IllegalArgumentException (target object isn't an instance of the
+    // declaring class), UnsupportedOperationException (immutable Map). The catch must cover
+    // them all so the graceful degradation path runs instead of bubbling up as a
+    // MavenExecutionException that aborts the build. We exercise the IllegalArgumentException
+    // branch here by passing a targetClass whose `configProperties` field exists but lives on
+    // a class the session isn't an instance of — Field.get(repoSession) then throws IAE.
+    DefaultRepositorySystemSession s = new DefaultRepositorySystemSession();
+    s.setReadOnly();
+    AzureDevOpsCredentialsExtension.installSessionConfig(s, "k", "v", UnrelatedConfigOwner.class);
+    assertFalse(s.getConfigProperties().containsKey("k"));
+  }
+
+  // Helper for the N5 test: has a `configProperties` field that getDeclaredField finds, but
+  // Field.get(repoSession) then throws IllegalArgumentException because the live
+  // DefaultRepositorySystemSession isn't an instance of UnrelatedConfigOwner. Triggers the
+  // newly-broadened RuntimeException catch in installSessionConfig.
+  @SuppressWarnings("unused")
+  static class UnrelatedConfigOwner {
+    java.util.Map<String, Object> configProperties = new java.util.HashMap<>();
   }
 
   @Test

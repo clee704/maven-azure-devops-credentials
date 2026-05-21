@@ -113,6 +113,21 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
             .isBefore(OffsetDateTime.now().plusMinutes(TOKEN_REFRESH_BEFORE_EXPIRY_MINUTES));
   }
 
+  // Graceful-degradation helper: when a refresh attempt fails AND we have a cached token
+  // that's NEAR expiry (within the 5-min refresh window) but still has real validity left,
+  // return its Bearer string so the caller can serve one more request instead of forcing a
+  // 401. Mirrors the Azure Identity SDK's own "refresh proactively but keep serving the
+  // previously-cached token until actual expiry if refresh fails" philosophy. Returns null
+  // if the cached token is missing, has no expiry, or has truly expired.
+  static String cachedTokenIfStillRealValid(AccessToken cached) {
+    if (cached != null
+        && cached.getExpiresAt() != null
+        && cached.getExpiresAt().isAfter(OffsetDateTime.now())) {
+      return cached.getToken();
+    }
+    return null;
+  }
+
   // Shared AccessToken cache, populated by the boot fetch in afterProjectsRead and read by
   // both the live-path entrySet() callback (LiveBearerHeadersMap) and the boot-path selector
   // (AzureDevOpsAuthSelector). One reference per extension instance; final-field semantics +
@@ -375,7 +390,14 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       java.lang.reflect.Field f = targetClass.getDeclaredField("configProperties");
       f.setAccessible(true);
       ((java.util.Map<String, Object>) f.get(repoSession)).put(key, value);
-    } catch (ReflectiveOperationException e) {
+    } catch (ReflectiveOperationException | RuntimeException e) {
+      // Broadened from just ReflectiveOperationException to also catch the runtime exceptions
+      // setAccessible(true) and Map.put can throw — InaccessibleObjectException (Java 9+ JPMS),
+      // SecurityException (custom SecurityManager), IllegalArgumentException (target object
+      // isn't an instance of the field's declaring class), UnsupportedOperationException
+      // (future Aether changing configProperties to an immutable map). All of those should
+      // route through the same graceful-degradation path as a NoSuchFieldException — log
+      // once, fall back to the boot-time settings injection, build keeps working.
       if (reflectionFailureLogged.compareAndSet(false, true)) {
         log.error(
             "Could not install live Authorization header for '{}'; mid-build token refresh is"
@@ -490,6 +512,16 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         }
         String token = getAccessToken(getSharedCredential(), sharedCachedToken);
         if (token == null) {
+          // N6 fallback: refresh failed but the cached near-expiry token may still have
+          // real validity. Serve it instead of returning null (which produces a 401);
+          // the next request will retry the refresh.
+          String fallback = cachedTokenIfStillRealValid(cached);
+          if (fallback != null) {
+            log.debug(
+                "Selector token refresh failed; serving cached token still valid until {}.",
+                cached.getExpiresAt());
+            return buildAuth(fallback);
+          }
           return null;
         }
         return buildAuth(token);
@@ -657,16 +689,31 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
         token = acquireTokenSingleFlight();
       } catch (RuntimeException e) {
         noteFailure("Failed to refresh Azure access token mid-build", e);
-        return null;
+        // N6 fallback: refresh failed but the cached token may still have real validity
+        // left (we got here because it's WITHIN the 5-min pre-expiry refresh window, not
+        // because it's expired). Serve the cached token rather than forcing a 401 during
+        // a transient credential blip; we'll retry on the next request.
+        return graceful401AvoidanceFallback(cached);
       }
       if (token == null) {
         // Mono.empty() — SDK returned no token without throwing. Same failure mode as the
         // catch path (request will 401), so go through the same rate-limited warn helper.
         noteFailure("Azure credential returned no token (Mono.empty())", null);
-        return null;
+        return graceful401AvoidanceFallback(cached);
       }
       inFailureState.set(false);
       return token.getToken();
+    }
+
+    private String graceful401AvoidanceFallback(AccessToken cached) {
+      String fallback = cachedTokenIfStillRealValid(cached);
+      if (fallback != null) {
+        logger.debug(
+            "Token refresh failed; serving cached token still valid until {}. Will retry"
+                + " refresh on the next request.",
+            cached.getExpiresAt());
+      }
+      return fallback;
     }
 
     // Single-flight via AtomicReference<CompletableFuture>: the FIRST thread into a burst
