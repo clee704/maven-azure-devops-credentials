@@ -59,7 +59,7 @@ public class AzureDevOpsCredentialsExtensionTest {
 
   @Before
   public void setUp() throws Exception {
-    AzureDevOpsCredentialsExtension.resetFailureGates();
+    SessionConfigInstaller.resetFailureGates();
     settings = new Settings();
     repoSession = new DefaultRepositorySystemSession();
     when(session.getSettings()).thenReturn(settings);
@@ -633,8 +633,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     when(mockCredential.getToken(any()))
         .thenReturn(Mono.just(new AccessToken("token-A", OffsetDateTime.now().plusHours(1))));
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
 
     assertEquals(1, map.entrySet().size());
     java.util.Map.Entry<String, String> entry = map.entrySet().iterator().next();
@@ -652,8 +651,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     when(mockCredential.getToken(any()))
         .thenReturn(Mono.just(new AccessToken("token-1", OffsetDateTime.now().plusHours(1))));
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
 
     // First call populates cache; subsequent calls within the TTL hit the cache.
     assertEquals("Bearer token-1", map.entrySet().iterator().next().getValue());
@@ -671,8 +669,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     when(mockCredential.getToken(any()))
         .thenReturn(Mono.just(new AccessToken("token-1", OffsetDateTime.now().plusHours(1))));
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
 
     map.entrySet().iterator().next().getValue();
     map.entrySet().iterator().next().getValue();
@@ -694,8 +691,8 @@ public class AzureDevOpsCredentialsExtensionTest {
     java.util.concurrent.atomic.AtomicReference<AccessToken> preCachedToken =
         new java.util.concurrent.atomic.AtomicReference<>(
             new AccessToken("pre-cached", OffsetDateTime.now().plusHours(1)));
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+    LiveBearerHeadersMap map =
+        LiveBearerHeadersMap.forTest(
             mockCredential,
             mock(org.slf4j.Logger.class),
             preTrippedGate,
@@ -720,8 +717,7 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenReturn(Mono.just(new AccessToken("fresh-token", OffsetDateTime.now().plusHours(1))))
         .thenReturn(Mono.just(new AccessToken("fresh-token-2", OffsetDateTime.now().plusHours(1))));
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
 
     // First call: cache empty, fetch near-expiry, cache it, return it.
     assertEquals("Bearer near-expiry", map.entrySet().iterator().next().getValue());
@@ -745,8 +741,7 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenThrow(new RuntimeException("transient-az-blip"))
         .thenReturn(Mono.just(new AccessToken("fresh-token", OffsetDateTime.now().plusHours(1))));
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
 
     // First call: cache empty, fetch near-expiry, return it. (1 getToken)
     assertEquals("Bearer near-expiry", map.entrySet().iterator().next().getValue());
@@ -764,8 +759,7 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenReturn(Mono.just(new AccessToken("near-expiry", OffsetDateTime.now().plusMinutes(2))))
         .thenReturn(Mono.empty());
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
 
     assertEquals("Bearer near-expiry", map.entrySet().iterator().next().getValue());
     assertEquals("Bearer near-expiry", map.entrySet().iterator().next().getValue());
@@ -780,8 +774,7 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenReturn(Mono.just(new AccessToken("expired", OffsetDateTime.now().minusMinutes(1))))
         .thenThrow(new RuntimeException("transient-az-blip"));
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
 
     // First call: cache empty, fetch returns already-expired token (cache it anyway).
     assertEquals("Bearer expired", map.entrySet().iterator().next().getValue());
@@ -799,8 +792,7 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenReturn(Mono.just(new AccessToken("no-expiry-1", null)))
         .thenReturn(Mono.just(new AccessToken("no-expiry-2", null)));
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
 
     assertEquals("Bearer no-expiry-1", map.entrySet().iterator().next().getValue());
     assertEquals("Bearer no-expiry-2", map.entrySet().iterator().next().getValue());
@@ -818,8 +810,8 @@ public class AzureDevOpsCredentialsExtensionTest {
     when(mockCredential.getToken(any())).thenReturn(Mono.just(new AccessToken("no-expiry", null)));
     java.util.concurrent.atomic.AtomicReference<AccessToken> sharedCache =
         new java.util.concurrent.atomic.AtomicReference<>();
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+    LiveBearerHeadersMap map =
+        LiveBearerHeadersMap.forTest(
             mockCredential,
             mock(org.slf4j.Logger.class),
             new java.util.concurrent.atomic.AtomicBoolean(false),
@@ -843,15 +835,15 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenReturn(Mono.just(new AccessToken("shared", OffsetDateTime.now().plusHours(1))));
     java.util.concurrent.atomic.AtomicReference<AccessToken> sharedCache =
         new java.util.concurrent.atomic.AtomicReference<>();
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap feedA =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+    LiveBearerHeadersMap feedA =
+        LiveBearerHeadersMap.forTest(
             mockCredential,
             mock(org.slf4j.Logger.class),
             new java.util.concurrent.atomic.AtomicBoolean(false),
             new java.util.concurrent.atomic.AtomicReference<>(),
             sharedCache);
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap feedB =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+    LiveBearerHeadersMap feedB =
+        LiveBearerHeadersMap.forTest(
             mockCredential,
             mock(org.slf4j.Logger.class),
             new java.util.concurrent.atomic.AtomicBoolean(false),
@@ -868,8 +860,7 @@ public class AzureDevOpsCredentialsExtensionTest {
   public void liveBearerHeadersMap_returnsNullValueOnNullToken() {
     when(mockCredential.getToken(any())).thenReturn(Mono.empty());
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
 
     // H1 contract: size() and entrySet().size() must agree. On failure we still emit one
     // entry; the value is null so Aether's HttpTransporter.commonHeaders() calls
@@ -882,8 +873,7 @@ public class AzureDevOpsCredentialsExtensionTest {
   public void liveBearerHeadersMap_returnsNullValueOnException() {
     when(mockCredential.getToken(any())).thenThrow(new RuntimeException("auth failed"));
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
 
     assertEquals(1, map.entrySet().size());
     assertNull(map.entrySet().iterator().next().getValue());
@@ -984,7 +974,7 @@ public class AzureDevOpsCredentialsExtensionTest {
   @Test
   public void installSessionConfig_writableSession() {
     DefaultRepositorySystemSession s = new DefaultRepositorySystemSession();
-    AzureDevOpsCredentialsExtension.installSessionConfig(s, "k1", "v1");
+    SessionConfigInstaller.installSessionConfig(s, "k1", "v1");
     assertEquals("v1", s.getConfigProperties().get("k1"));
   }
 
@@ -998,7 +988,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     } catch (IllegalStateException expected) {
       /* expected */
     }
-    AzureDevOpsCredentialsExtension.installSessionConfig(s, "k2", "v2");
+    SessionConfigInstaller.installSessionConfig(s, "k2", "v2");
     assertEquals("v2", s.getConfigProperties().get("k2"));
   }
 
@@ -1014,27 +1004,25 @@ public class AzureDevOpsCredentialsExtensionTest {
     // private static AtomicBoolean — accessed via reflection (same justification as N21's
     // sharedCachedToken inspection; @Before's resetFailureGates() ensures clean state).
     java.lang.reflect.Field gateField =
-        AzureDevOpsCredentialsExtension.class.getDeclaredField("verificationFailureLogged");
+        SessionConfigInstaller.class.getDeclaredField("verificationFailureLogged");
     gateField.setAccessible(true);
     java.util.concurrent.atomic.AtomicBoolean gate =
         (java.util.concurrent.atomic.AtomicBoolean) gateField.get(null);
     assertFalse("Pre-condition: @Before resetFailureGates left gate clear", gate.get());
 
     // Match path (value visible): no-op — gate must stay clear.
-    AzureDevOpsCredentialsExtension.verifyConfigInstalled(
+    SessionConfigInstaller.verifyConfigInstalled(
         java.util.Collections.singletonMap("k3", (Object) "v3"), "k3", "v3");
     assertFalse("Match path must not trip the gate", gate.get());
 
     // First mismatch: gate flips (and the log.error fires; we don't intercept stderr here
     // because the JaCoCo coverage check + the gate transition together pin the behavior).
-    AzureDevOpsCredentialsExtension.verifyConfigInstalled(
-        java.util.Collections.emptyMap(), "k3", "v3");
+    SessionConfigInstaller.verifyConfigInstalled(java.util.Collections.emptyMap(), "k3", "v3");
     assertTrue("First mismatch must trip the rate-limit gate", gate.get());
 
     // Second mismatch: gate stays flipped (compareAndSet(false, true) returns false, log
     // call is skipped). A regression that removed the gate would silently re-log here.
-    AzureDevOpsCredentialsExtension.verifyConfigInstalled(
-        java.util.Collections.emptyMap(), "k4", "v4");
+    SessionConfigInstaller.verifyConfigInstalled(java.util.Collections.emptyMap(), "k4", "v4");
     assertTrue("Gate must stay flipped on second mismatch (rate-limit invariant)", gate.get());
   }
 
@@ -1046,8 +1034,7 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenThrow(new RuntimeException("auth failed"))
         .thenThrow(new RuntimeException("auth failed"));
     org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential, mockLog);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential, mockLog);
     // All three calls return one entry with empty value (H1: size/entrySet consistency).
     assertNull(map.entrySet().iterator().next().getValue());
     assertNull(map.entrySet().iterator().next().getValue());
@@ -1066,8 +1053,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     // radius).
     when(mockCredential.getToken(any())).thenReturn(Mono.empty());
     org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential, mockLog);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential, mockLog);
     assertNull(map.entrySet().iterator().next().getValue());
     assertNull(map.entrySet().iterator().next().getValue());
     assertNull(map.entrySet().iterator().next().getValue());
@@ -1093,8 +1079,7 @@ public class AzureDevOpsCredentialsExtensionTest {
         .thenReturn(Mono.just(new AccessToken("recovered", OffsetDateTime.now().plusMinutes(2))))
         .thenThrow(new RuntimeException("fail-2"));
     org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential, mockLog);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential, mockLog);
     assertNull(map.entrySet().iterator().next().getValue());
     assertEquals("Bearer recovered", map.entrySet().iterator().next().getValue());
     // Third call: refresh fails but cached "recovered" still has real validity. F1: serve it,
@@ -1118,8 +1103,7 @@ public class AzureDevOpsCredentialsExtensionTest {
             Mono.just(new AccessToken("already-expired", OffsetDateTime.now().minusSeconds(10))))
         .thenThrow(new RuntimeException("fail-2"));
     org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential, mockLog);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential, mockLog);
     assertNull(map.entrySet().iterator().next().getValue());
     // Recovery — cache populated with the already-expired token. The gate is reset.
     assertEquals("Bearer already-expired", map.entrySet().iterator().next().getValue());
@@ -1139,15 +1123,15 @@ public class AzureDevOpsCredentialsExtensionTest {
     org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
     java.util.concurrent.atomic.AtomicBoolean shared =
         new java.util.concurrent.atomic.AtomicBoolean(false);
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap feedA =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+    LiveBearerHeadersMap feedA =
+        LiveBearerHeadersMap.forTest(
             mockCredential,
             mockLog,
             shared,
             new java.util.concurrent.atomic.AtomicReference<>(),
             new java.util.concurrent.atomic.AtomicReference<>());
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap feedB =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+    LiveBearerHeadersMap feedB =
+        LiveBearerHeadersMap.forTest(
             mockCredential,
             mockLog,
             shared,
@@ -1167,10 +1151,8 @@ public class AzureDevOpsCredentialsExtensionTest {
     // session config, an exception toString quoting its arguments, equals() comparison
     // against another map) would (a) round-trip to Entra and (b) in the case of equals(),
     // materialize the JWT into a String. Identity overrides eliminate both hazards.
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap other =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap other = LiveBearerHeadersMap.forTest(mockCredential);
     assertEquals(1, map.size());
     assertTrue("identity: map equals itself", map.equals(map));
     assertFalse("identity: map does not equal a peer instance", map.equals(other));
@@ -1183,8 +1165,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     // Override AbstractMap.toString(): the default iterates entrySet() (-> credential call
     // + Bearer JWT in the string). A regression that removed our override would expose
     // bearer tokens via any framework logger that dumps the headers map.
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
     String s = map.toString();
     assertFalse("toString must not contain a Bearer token", s.contains("Bearer "));
     // The label intentionally surfaces the header *names* (keys=[Authorization]) for
@@ -1203,8 +1184,8 @@ public class AzureDevOpsCredentialsExtensionTest {
     // assert the two contexts are distinct instances.
     when(mockCredential.getToken(any()))
         .thenReturn(Mono.just(new AccessToken("t1", OffsetDateTime.now().plusHours(1))));
-    AzureDevOpsCredentialsExtension.blockForToken(mockCredential);
-    AzureDevOpsCredentialsExtension.blockForToken(mockCredential);
+    TokenAcquisition.blockForToken(mockCredential);
+    TokenAcquisition.blockForToken(mockCredential);
     org.mockito.ArgumentCaptor<com.azure.core.credential.TokenRequestContext> captor =
         org.mockito.ArgumentCaptor.forClass(com.azure.core.credential.TokenRequestContext.class);
     verify(mockCredential, times(2)).getToken(captor.capture());
@@ -1228,7 +1209,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     TokenCredential stuck = mock(TokenCredential.class);
     when(stuck.getToken(any())).thenReturn(Mono.never());
     try {
-      AzureDevOpsCredentialsExtension.blockForToken(stuck, java.time.Duration.ofMillis(200));
+      TokenAcquisition.blockForToken(stuck, java.time.Duration.ofMillis(200));
       fail("blockForToken must throw IllegalStateException when the credential never completes");
     } catch (IllegalStateException expected) {
       // expected on .block(Duration) timeout
@@ -1247,7 +1228,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     // a class the session isn't an instance of — Field.get(repoSession) then throws IAE.
     DefaultRepositorySystemSession s = new DefaultRepositorySystemSession();
     s.setReadOnly();
-    AzureDevOpsCredentialsExtension.installSessionConfig(s, "k", "v", UnrelatedConfigOwner.class);
+    SessionConfigInstaller.installSessionConfig(s, "k", "v", UnrelatedConfigOwner.class);
     assertFalse(s.getConfigProperties().containsKey("k"));
   }
 
@@ -1265,7 +1246,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     DefaultRepositorySystemSession s = new DefaultRepositorySystemSession();
     s.setReadOnly();
     // Object.class has no "configProperties" field -> NoSuchFieldException -> caught and logged.
-    AzureDevOpsCredentialsExtension.installSessionConfig(s, "k3", "v3", Object.class);
+    SessionConfigInstaller.installSessionConfig(s, "k3", "v3", Object.class);
     assertFalse(s.getConfigProperties().containsKey("k3"));
   }
 
@@ -1279,11 +1260,11 @@ public class AzureDevOpsCredentialsExtensionTest {
     DefaultRepositorySystemSession failingSession = new DefaultRepositorySystemSession();
     failingSession.setReadOnly();
     // First call: trip the gate.
-    AzureDevOpsCredentialsExtension.installSessionConfig(failingSession, "k", "v", Object.class);
+    SessionConfigInstaller.installSessionConfig(failingSession, "k", "v", Object.class);
     // Second call: now hits the early-return at the top — won't even attempt setConfigProperty,
     // which means a WRITABLE session WOULDN'T get the value installed either.
     DefaultRepositorySystemSession writableSession = new DefaultRepositorySystemSession();
-    AzureDevOpsCredentialsExtension.installSessionConfig(writableSession, "k2", "v2");
+    SessionConfigInstaller.installSessionConfig(writableSession, "k2", "v2");
     assertFalse(
         "Second call should early-return after prior reflective failure tripped the gate",
         writableSession.getConfigProperties().containsKey("k2"));
@@ -1322,8 +1303,8 @@ public class AzureDevOpsCredentialsExtensionTest {
 
     java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<AccessToken>>
         sharedInFlight = new java.util.concurrent.atomic.AtomicReference<>();
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+    LiveBearerHeadersMap map =
+        LiveBearerHeadersMap.forTest(
             mockCredential,
             mock(org.slf4j.Logger.class),
             new java.util.concurrent.atomic.AtomicBoolean(false),
@@ -1390,8 +1371,7 @@ public class AzureDevOpsCredentialsExtensionTest {
     when(mockCredential.getToken(any()))
         .thenReturn(Mono.just(new AccessToken("t1", OffsetDateTime.now().plusMinutes(2))))
         .thenReturn(Mono.just(new AccessToken("t2", OffsetDateTime.now().plusHours(1))));
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
     assertEquals("Bearer t1", map.entrySet().iterator().next().getValue());
     assertEquals("Bearer t2", map.entrySet().iterator().next().getValue());
     verify(mockCredential, times(2)).getToken(any());
@@ -1413,8 +1393,8 @@ public class AzureDevOpsCredentialsExtensionTest {
     sharedInFlight.set(failedFuture);
 
     org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+    LiveBearerHeadersMap map =
+        LiveBearerHeadersMap.forTest(
             mockCredential,
             mockLog,
             new java.util.concurrent.atomic.AtomicBoolean(false),
@@ -1443,8 +1423,8 @@ public class AzureDevOpsCredentialsExtensionTest {
     sharedInFlight.set(failedFuture);
 
     org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+    LiveBearerHeadersMap map =
+        LiveBearerHeadersMap.forTest(
             mockCredential,
             mockLog,
             new java.util.concurrent.atomic.AtomicBoolean(false),
@@ -1469,8 +1449,8 @@ public class AzureDevOpsCredentialsExtensionTest {
     failedFuture.completeExceptionally(new Error("simulated-jvm-error"));
     sharedInFlight.set(failedFuture);
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+    LiveBearerHeadersMap map =
+        LiveBearerHeadersMap.forTest(
             mockCredential,
             mock(org.slf4j.Logger.class),
             new java.util.concurrent.atomic.AtomicBoolean(false),
@@ -1496,8 +1476,7 @@ public class AzureDevOpsCredentialsExtensionTest {
             invocation -> {
               throw new Error("leader-jvm-error");
             });
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(mockCredential);
+    LiveBearerHeadersMap map = LiveBearerHeadersMap.forTest(mockCredential);
 
     try {
       map.entrySet();
@@ -1531,8 +1510,8 @@ public class AzureDevOpsCredentialsExtensionTest {
 
     java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<AccessToken>>
         sharedInFlight = new java.util.concurrent.atomic.AtomicReference<>();
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
+    LiveBearerHeadersMap map =
+        LiveBearerHeadersMap.forTest(
             mockCredential,
             mock(org.slf4j.Logger.class),
             new java.util.concurrent.atomic.AtomicBoolean(false),
@@ -1600,8 +1579,8 @@ public class AzureDevOpsCredentialsExtensionTest {
     java.util.concurrent.atomic.AtomicInteger peekCalls =
         new java.util.concurrent.atomic.AtomicInteger();
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(
+    LiveBearerHeadersMap map =
+        new LiveBearerHeadersMap(
             mockCredential,
             mock(org.slf4j.Logger.class),
             new java.util.concurrent.atomic.AtomicBoolean(false),
@@ -1638,8 +1617,8 @@ public class AzureDevOpsCredentialsExtensionTest {
     java.util.concurrent.atomic.AtomicReference<AccessToken> sharedCache =
         new java.util.concurrent.atomic.AtomicReference<>();
 
-    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap map =
-        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(
+    LiveBearerHeadersMap map =
+        new LiveBearerHeadersMap(
             mockCredential,
             mock(org.slf4j.Logger.class),
             new java.util.concurrent.atomic.AtomicBoolean(false),
