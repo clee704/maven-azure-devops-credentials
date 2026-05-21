@@ -30,7 +30,6 @@ import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.inject.Inject;
@@ -135,11 +134,15 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     DefaultRepositorySystemSession repoSession =
         (DefaultRepositorySystemSession) session.getRepositorySession();
     TokenCredential credential = getSharedCredential();
+    // Share one warn-rate-limiter across every per-repo LiveBearerHeadersMap. A credential
+    // outage affects all feeds simultaneously (they share `credential`), so without this we'd
+    // warn N times per outage on a workspace with N ADO feeds.
+    AtomicBoolean sharedFailureState = new AtomicBoolean(false);
     for (String repoId : repoIds) {
       installSessionConfig(
           repoSession,
           ConfigurationProperties.HTTP_HEADERS + "." + repoId,
-          new LiveBearerHeadersMap(credential));
+          new LiveBearerHeadersMap(credential, log, sharedFailureState));
     }
 
     // Also do an eager one-shot token acquisition for legacy/fallback paths:
@@ -251,7 +254,11 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
 
   static void verifyConfigInstalled(
       java.util.Map<String, Object> configPropertiesView, String key, Object value) {
-    if (!Objects.equals(configPropertiesView.get(key), value)) {
+    // Reference equality is what we actually care about: did the same LiveBearerHeadersMap
+    // instance we wrote show up in the view? Using Objects.equals here would dispatch to
+    // AbstractMap.equals on a mismatch, which calls size() -> entrySet() -> credential.getToken()
+    // — an unwanted side effect during what is supposed to be a passive diagnostic.
+    if (configPropertiesView.get(key) != value) {
       log.error(
           "Reflective install of '{}' completed but value is not visible via"
               + " getConfigProperties(); mid-build token refresh may not take effect.",
@@ -356,24 +363,37 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
    * commonHeaders()} in the active maven-resolver-transport-http first.
    */
   static class LiveBearerHeadersMap extends AbstractMap<String, String> {
+    // The scopes argument never changes and the SDK only reads from it; reuse one instance
+    // across every per-request acquireToken() call to avoid the per-HTTP-request allocation.
+    private static final TokenRequestContext TOKEN_REQUEST =
+        new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
+
     private final TokenCredential credential;
     private final org.slf4j.Logger logger;
     // Rate-limits the per-request failure warning: {@code entrySet()} is called on EVERY
     // outbound HTTP request, so a sustained credential outage during a 1000-artifact resolve
     // would otherwise drown the log in 1000 identical warnings before the user sees the 401.
-    // Log on transition into the failure state; silently reset on the next success.
-    private final AtomicBoolean inFailureState = new AtomicBoolean(false);
+    // Log on transition into the failure state; silently reset on the next success. The gate
+    // is shared across every per-repo instance constructed in afterProjectsRead so a single
+    // outage warns at most once across all feeds, not once per feed.
+    private final AtomicBoolean inFailureState;
 
     LiveBearerHeadersMap(TokenCredential credential) {
-      this(credential, log);
+      this(credential, log, new AtomicBoolean(false));
     }
 
     // Logger-injection overload exists so unit tests can verify the warn rate-limiter without
     // pulling in an SLF4J test appender dependency. Production callers always use the
-    // single-arg constructor.
+    // single-arg constructor or the three-arg variant that shares the failure-state gate.
     LiveBearerHeadersMap(TokenCredential credential, org.slf4j.Logger logger) {
+      this(credential, logger, new AtomicBoolean(false));
+    }
+
+    LiveBearerHeadersMap(
+        TokenCredential credential, org.slf4j.Logger logger, AtomicBoolean sharedFailureState) {
       this.credential = credential;
       this.logger = logger;
+      this.inFailureState = sharedFailureState;
     }
 
     @Override
@@ -407,8 +427,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       // invocations; adding a synchronized gate here would serialize EVERY per-request entrySet()
       // call (the common path: cached token, no SDK round-trip), which is a worse trade.
       try {
-        TokenRequestContext request = new TokenRequestContext().addScopes(AZURE_DEVOPS_SCOPE);
-        AccessToken token = credential.getToken(request).block();
+        AccessToken token = credential.getToken(TOKEN_REQUEST).block();
         if (token == null) {
           // Mono.empty() — SDK returned no token without throwing. Same failure mode as the
           // catch path (request will 401), so go through the same rate-limited warn helper.

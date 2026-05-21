@@ -691,6 +691,25 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
+  public void liveBearerHeadersMap_sharedFailureStateRateLimitsAcrossInstances() {
+    // S1: a workspace with N ADO feeds shares one AtomicBoolean across all per-repo maps so a
+    // single credential outage warns at most once total, not once per feed.
+    when(mockCredential.getToken(any())).thenThrow(new RuntimeException("auth failed"));
+    org.slf4j.Logger mockLog = mock(org.slf4j.Logger.class);
+    java.util.concurrent.atomic.AtomicBoolean shared =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap feedA =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential, mockLog, shared);
+    AzureDevOpsCredentialsExtension.LiveBearerHeadersMap feedB =
+        new AzureDevOpsCredentialsExtension.LiveBearerHeadersMap(mockCredential, mockLog, shared);
+    assertTrue(feedA.entrySet().isEmpty());
+    assertTrue(feedB.entrySet().isEmpty());
+    assertTrue(feedA.entrySet().isEmpty());
+    // ONE warn total across both instances, not two.
+    verify(mockLog, times(1)).warn(anyString(), anyString(), any(Throwable.class));
+  }
+
+  @Test
   public void liveBearerHeadersMap_toStringDoesNotLeakBearerToken() {
     // Override AbstractMap.toString(): the default iterates entrySet() (-> credential call
     // + Bearer JWT in the string). A regression that removed our override would expose
