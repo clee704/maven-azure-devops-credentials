@@ -489,7 +489,7 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
-  public void afterSessionStart_selectorShareCacheWithLivePath() throws MavenExecutionException {
+  public void afterSessionStart_selectorSharesCacheWithLivePath() throws MavenExecutionException {
     // N4: the selector's slow-path getAccessToken now writes to sharedCachedToken, so a
     // later live-path entrySet() call hits the cache instead of forking a second `az`
     // subprocess. Pre-N4 this would be 2 `getToken()` calls (1 selector + 1 live-path);
@@ -1111,10 +1111,18 @@ public class AzureDevOpsCredentialsExtensionTest {
         new java.util.concurrent.atomic.AtomicBoolean(false);
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap feedA =
         AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
-            mockCredential, mockLog, shared);
+            mockCredential,
+            mockLog,
+            shared,
+            new java.util.concurrent.atomic.AtomicReference<>(),
+            new java.util.concurrent.atomic.AtomicReference<>());
     AzureDevOpsCredentialsExtension.LiveBearerHeadersMap feedB =
         AzureDevOpsCredentialsExtension.LiveBearerHeadersMap.forTest(
-            mockCredential, mockLog, shared);
+            mockCredential,
+            mockLog,
+            shared,
+            new java.util.concurrent.atomic.AtomicReference<>(),
+            new java.util.concurrent.atomic.AtomicReference<>());
     assertNull(feedA.entrySet().iterator().next().getValue());
     assertNull(feedB.entrySet().iterator().next().getValue());
     assertNull(feedA.entrySet().iterator().next().getValue());
@@ -1289,7 +1297,8 @@ public class AzureDevOpsCredentialsExtensionTest {
             mockCredential,
             mock(org.slf4j.Logger.class),
             new java.util.concurrent.atomic.AtomicBoolean(false),
-            sharedInFlight);
+            sharedInFlight,
+            new java.util.concurrent.atomic.AtomicReference<>());
 
     java.util.concurrent.ExecutorService pool =
         java.util.concurrent.Executors.newFixedThreadPool(threadCount);
@@ -1379,7 +1388,8 @@ public class AzureDevOpsCredentialsExtensionTest {
             mockCredential,
             mockLog,
             new java.util.concurrent.atomic.AtomicBoolean(false),
-            sharedInFlight);
+            sharedInFlight,
+            new java.util.concurrent.atomic.AtomicReference<>());
 
     // entrySet returns 1 entry with empty value (failure handled by acquireToken's catch).
     assertNull(map.entrySet().iterator().next().getValue());
@@ -1408,7 +1418,8 @@ public class AzureDevOpsCredentialsExtensionTest {
             mockCredential,
             mockLog,
             new java.util.concurrent.atomic.AtomicBoolean(false),
-            sharedInFlight);
+            sharedInFlight,
+            new java.util.concurrent.atomic.AtomicReference<>());
 
     // Same user-facing behavior: failure handled, null Bearer (header stripped), build can
     // continue.
@@ -1433,7 +1444,8 @@ public class AzureDevOpsCredentialsExtensionTest {
             mockCredential,
             mock(org.slf4j.Logger.class),
             new java.util.concurrent.atomic.AtomicBoolean(false),
-            sharedInFlight);
+            sharedInFlight,
+            new java.util.concurrent.atomic.AtomicReference<>());
 
     try {
       map.entrySet();
@@ -1494,7 +1506,8 @@ public class AzureDevOpsCredentialsExtensionTest {
             mockCredential,
             mock(org.slf4j.Logger.class),
             new java.util.concurrent.atomic.AtomicBoolean(false),
-            sharedInFlight);
+            sharedInFlight,
+            new java.util.concurrent.atomic.AtomicReference<>());
 
     java.util.concurrent.ExecutorService pool =
         java.util.concurrent.Executors.newFixedThreadPool(threadCount);

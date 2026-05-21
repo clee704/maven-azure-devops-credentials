@@ -651,28 +651,27 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     }
 
     // Test factories — explicit `forTest` naming so production code grep doesn't surface
-    // them as ambiguous candidates. Each fills the remaining shared-state slots with fresh
-    // local refs so the test instance is self-contained.
+    // them as ambiguous candidates. Each overload inlines its defaults directly into the
+    // 5-arg LiveBearerHeadersMap constructor call so a reader can see at the call site
+    // what shared-state defaults a given test gets without chasing `this(...)` / `forTest(
+    // ...)` delegation hops (the N27 collapse — avoids re-introducing the telescoping
+    // pattern at the factory level that N7 collapsed at the constructor level).
     static LiveBearerHeadersMap forTest(TokenCredential credential) {
-      return forTest(credential, log);
+      return new LiveBearerHeadersMap(
+          credential,
+          log,
+          new AtomicBoolean(false),
+          new AtomicReference<>(),
+          new AtomicReference<>());
     }
 
     static LiveBearerHeadersMap forTest(TokenCredential credential, org.slf4j.Logger logger) {
-      return forTest(credential, logger, new AtomicBoolean(false));
-    }
-
-    static LiveBearerHeadersMap forTest(
-        TokenCredential credential, org.slf4j.Logger logger, AtomicBoolean sharedFailureState) {
-      return forTest(credential, logger, sharedFailureState, new AtomicReference<>());
-    }
-
-    static LiveBearerHeadersMap forTest(
-        TokenCredential credential,
-        org.slf4j.Logger logger,
-        AtomicBoolean sharedFailureState,
-        AtomicReference<CompletableFuture<AccessToken>> sharedInFlightToken) {
       return new LiveBearerHeadersMap(
-          credential, logger, sharedFailureState, sharedInFlightToken, new AtomicReference<>());
+          credential,
+          logger,
+          new AtomicBoolean(false),
+          new AtomicReference<>(),
+          new AtomicReference<>());
     }
 
     // Full-fidelity test factory: same shape as production(...) but named with the test
@@ -726,6 +725,10 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // future Aether bump or a custom extension starts calling get()/values()/keySet() on
     // this map, the AbstractMap defaults will Do The Right Thing — return the live token —
     // because the caller asked for it.
+    //
+    // isEmpty() is also inherited (not overridden) but is SAFE for passive callers:
+    // AbstractMap.isEmpty() returns `size() == 0`, and our size() override returns 1 — so
+    // isEmpty() returns false without touching entrySet() or triggering a credential call.
     @Override
     public int size() {
       return 1;
@@ -956,16 +959,31 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   }
 
   TokenCredential createCredential() {
-    // Defense-in-depth on top of TOKEN_ACQUISITION_TIMEOUT: cap the `az` subprocess at 30s
-    // so even on a wedged CLI we surface a meaningful error well before the outer .block()
-    // ceiling kicks in. The outer block() timeout still covers Environment + ManagedIdentity
-    // (which don't expose a processTimeout knob).
+    // Defense-in-depth on top of TOKEN_ACQUISITION_TIMEOUT: cap the `az` subprocess at
+    // CLI_PROCESS_TIMEOUT so even on a wedged CLI we surface a meaningful error well before
+    // the outer .block() ceiling kicks in. The outer block() timeout still covers
+    // Environment + ManagedIdentity (which don't expose a processTimeout knob).
     return new ChainedTokenCredentialBuilder()
-        .addLast(new AzureCliCredentialBuilder().processTimeout(Duration.ofSeconds(30)).build())
+        .addLast(new AzureCliCredentialBuilder().processTimeout(CLI_PROCESS_TIMEOUT).build())
         .addLast(new EnvironmentCredentialBuilder().build())
         .addLast(new ManagedIdentityCredentialBuilder().build())
         .build();
   }
+
+  // Inner-tier subprocess timeout for AzureCliCredential. Sits between "fast happy path"
+  // (typical `az account get-access-token` is <5s on a warm system) and the outer
+  // TOKEN_ACQUISITION_TIMEOUT (2min, the absolute ceiling that covers every provider in
+  // the chain). 60s is the empirical sweet spot: enough headroom for a slow CI runner +
+  // an `az`-side MSAL refresh hop + a brief network blip, while still surfacing wedged
+  // / hanging cases ~3× faster than the outer ceiling. Bumping further (90s, 120s) would
+  // make the inner knob redundant with the outer one for any reasonable diagnostic
+  // purpose. If you find this firing in legitimate-but-slow scenarios, the right escape
+  // hatch is to set the cap higher here rather than to remove it — the WARN that surfaces
+  // ("Failed to acquire Azure access token. Tried Azure CLI, environment variables, and
+  // Managed Identity") doesn't currently distinguish "az timed out internally" from "the
+  // whole chain failed for some other reason"; if that becomes a common confusion the
+  // remediation is to add a CLI-specific hint to the WARN, not to relax this cap.
+  private static final Duration CLI_PROCESS_TIMEOUT = Duration.ofSeconds(60);
 
   // Single boot-path token-acquisition method. Used by afterProjectsRead (boot fetch) and
   // by AzureDevOpsAuthSelector (cache-miss slow path). Both callers pass sharedCachedToken
