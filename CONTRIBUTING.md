@@ -44,7 +44,7 @@ automatically. Run `mvn spotless:apply` to fix any violations before committing.
 
 ## Coverage
 
-Unit test coverage is gated at 100% instruction and branch coverage via JaCoCo. Every new code
+Unit test coverage is gated at 100% instruction coverage via JaCoCo. Every new code
 path must have a corresponding unit test. Run `mvn verify` to check locally; the HTML report is
 generated at `target/site/jacoco/index.html`.
 

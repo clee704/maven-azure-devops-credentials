@@ -59,6 +59,7 @@ public class AzureDevOpsCredentialsExtensionTest {
 
   @Before
   public void setUp() throws Exception {
+    SessionConfigInstaller.resetFailureGates();
     settings = new Settings();
     repoSession = new DefaultRepositorySystemSession();
     when(session.getSettings()).thenReturn(settings);
@@ -363,7 +364,10 @@ public class AzureDevOpsCredentialsExtensionTest {
   }
 
   @Test
-  public void afterProjectsRead_restoresLogLevelProperty() throws MavenExecutionException {
+  public void afterProjectsRead_doesNotTouchLogProperty() throws MavenExecutionException {
+    // The SLF4J property suppression moved from afterProjectsRead to afterSessionStart in
+    // 135a42c; this test now passively verifies that afterProjectsRead doesn't disturb a
+    // pre-set value (the property's value test for afterSessionStart lives separately).
     String prop = "org.slf4j.simpleLogger.log.com.azure.identity";
     System.setProperty(prop, "debug");
     try {
@@ -482,6 +486,286 @@ public class AzureDevOpsCredentialsExtensionTest {
     assertNotNull(selector.getAuthentication(adoRemoteRepo("Feed1")));
     assertNotNull(selector.getAuthentication(adoRemoteRepo("Feed2")));
     verify(mockCredential, times(1)).getToken(any());
+  }
+
+  @Test
+  public void afterSessionStart_selectorSharesCacheWithLivePath() throws MavenExecutionException {
+    // N4: the selector's slow-path getAccessToken now writes to sharedCachedToken, so a
+    // later live-path entrySet() call hits the cache instead of forking a second `az`
+    // subprocess. Pre-N4 this would be 2 `getToken()` calls (1 selector + 1 live-path);
+    // after the fix it's 1.
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(project.getRemoteArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(project.getPluginArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
+
+    // afterSessionStart installs the selector; calling getAuthentication here forces the
+    // selector's slow-path fetch BEFORE afterProjectsRead's boot fetch (simulates the
+    // ordering where Aether starts resolving project poms before the lifecycle reaches
+    // afterProjectsRead — rare but possible with some Maven configurations).
+    extension.afterSessionStart(session);
+    AuthenticationSelector selector = repoSession.getAuthenticationSelector();
+    selector.getAuthentication(adoRemoteRepo("MyFeed"));
+
+    // Now run afterProjectsRead — its boot fetch would normally also call getToken, but
+    // the selector already populated sharedCachedToken so this should hit the cache.
+    extension.afterProjectsRead(session);
+
+    // Plus a live-path call should also hit the cache.
+    Object headers = repoSession.getConfigProperties().get("aether.connector.http.headers.MyFeed");
+    ((java.util.Map<?, ?>) headers).entrySet().iterator().next();
+
+    // Exactly ONE getToken() call across selector + boot fetch + live-path request.
+    verify(mockCredential, times(1)).getToken(any());
+  }
+
+  @Test
+  public void afterSessionStart_selectorFallsBackToStillRealValidCachedTokenOnRefreshFailure()
+      throws MavenExecutionException {
+    // N6 selector path: when the cached token is in the refresh window (near-expiry) and
+    // the slow-path fetch returns null (Mono.empty), the selector falls back to the
+    // still-real-valid cached token instead of returning null. Mirrors the live-headers
+    // path fallback so users don't see a 401 during a transient credential blip just
+    // because they hit the 5-min refresh window.
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("near-expiry", OffsetDateTime.now().plusMinutes(2))))
+        .thenReturn(Mono.empty());
+
+    extension.afterSessionStart(session);
+    AuthenticationSelector selector = repoSession.getAuthenticationSelector();
+    // First call: cache empty, slow-path fetch returns near-expiry, cache it, return auth.
+    assertNotNull(selector.getAuthentication(adoRemoteRepo("MyFeed")));
+    // Second call: cache near-expiry, slow-path fetch returns null. WITHOUT N6 fallback this
+    // would return null (the build sees 401); WITH it, we serve the still-real-valid cached
+    // token.
+    assertNotNull(
+        "Selector must fall back to cached near-expiry token when refresh fails",
+        selector.getAuthentication(adoRemoteRepo("MyFeed")));
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void afterSessionStart_selectorDoesNotPoisonSharedCacheWithNullExpiryToken()
+      throws Exception {
+    // N21: regression catcher for the N15 guard on the boot/selector path
+    // (getAccessToken's `token.getExpiresAt() != null` check). A future refactor that drops
+    // that clause would silently land a null-expiry AccessToken in sharedCachedToken; every
+    // subsequent live-path entrySet() would then see isNearExpiry(cached)==true (null
+    // expiry treated as stale), re-enter the slow path, and re-fork `az` per request — the
+    // M1 regression the N15 guard was added to prevent. The live-path side is covered by
+    // liveBearerHeadersMap_doesNotPoisonCacheWithNullExpiryToken; this is its boot-side
+    // sibling, inspecting the extension's private sharedCachedToken field via reflection.
+    when(mockCredential.getToken(any())).thenReturn(Mono.just(new AccessToken("no-expiry", null)));
+    extension.afterSessionStart(session);
+    AuthenticationSelector selector = repoSession.getAuthenticationSelector();
+
+    // Current request is still served the (degenerate but only available) token.
+    assertNotNull(selector.getAuthentication(adoRemoteRepo("MyFeed")));
+
+    // But the shared cache must stay empty — invariant intact for the next caller.
+    Field cacheField = AzureDevOpsCredentialsExtension.class.getDeclaredField("sharedCachedToken");
+    cacheField.setAccessible(true);
+    java.util.concurrent.atomic.AtomicReference<AccessToken> cache =
+        (java.util.concurrent.atomic.AtomicReference<AccessToken>) cacheField.get(extension);
+    assertNull(
+        "Boot/selector path must not poison sharedCachedToken with a null-expiry token",
+        cache.get());
+  }
+
+  @Test
+  public void afterSessionStart_selectorConcurrentCallsCoalesceToOneFetch() throws Exception {
+    // N4 coverage: 8 threads call getAuthentication simultaneously. All see an empty cache
+    // on the fast path (sharedCachedToken just reset by afterSessionStart), enter the
+    // synchronized slow path, and the leader fetches + populates while the other 7 take
+    // the cache-recheck-hit branch on lock re-entry. Result: exactly ONE getToken() across
+    // all 8 calls.
+    int threadCount = 8;
+    java.util.concurrent.CountDownLatch workersReady =
+        new java.util.concurrent.CountDownLatch(threadCount);
+    java.util.concurrent.CountDownLatch startLatch = new java.util.concurrent.CountDownLatch(1);
+    java.util.concurrent.CountDownLatch leaderInGetToken =
+        new java.util.concurrent.CountDownLatch(1);
+    java.util.concurrent.CountDownLatch releaseLeader = new java.util.concurrent.CountDownLatch(1);
+
+    when(mockCredential.getToken(any()))
+        .thenAnswer(
+            invocation -> {
+              leaderInGetToken.countDown();
+              releaseLeader.await();
+              return Mono.just(new AccessToken("shared-token", OffsetDateTime.now().plusHours(1)));
+            });
+
+    extension.afterSessionStart(session);
+    AuthenticationSelector selector = repoSession.getAuthenticationSelector();
+
+    java.util.concurrent.ExecutorService pool =
+        java.util.concurrent.Executors.newFixedThreadPool(threadCount);
+    try {
+      java.util.List<java.util.concurrent.Future<Authentication>> futures = new ArrayList<>();
+      for (int i = 0; i < threadCount; i++) {
+        futures.add(
+            pool.submit(
+                () -> {
+                  workersReady.countDown();
+                  startLatch.await();
+                  return selector.getAuthentication(adoRemoteRepo("MyFeed"));
+                }));
+      }
+      assertTrue(workersReady.await(5, java.util.concurrent.TimeUnit.SECONDS));
+      startLatch.countDown();
+      assertTrue(leaderInGetToken.await(5, java.util.concurrent.TimeUnit.SECONDS));
+      releaseLeader.countDown();
+      for (java.util.concurrent.Future<Authentication> f : futures) {
+        assertNotNull(f.get(5, java.util.concurrent.TimeUnit.SECONDS));
+      }
+    } finally {
+      pool.shutdown();
+    }
+
+    verify(mockCredential, times(1)).getToken(any());
+  }
+
+  // === LiveBearerHeadersMap ===
+
+  @Test
+  public void afterSessionStart_suppressesAzureIdentityLogByDefault()
+      throws MavenExecutionException {
+    String prop = "org.slf4j.simpleLogger.log.com.azure.identity";
+    System.clearProperty(prop);
+    try {
+      extension.afterSessionStart(session);
+      assertEquals("off", System.getProperty(prop));
+    } finally {
+      System.clearProperty(prop);
+    }
+  }
+
+  @Test
+  public void afterSessionStart_preservesUserAzureIdentityLogOverride()
+      throws MavenExecutionException {
+    String prop = "org.slf4j.simpleLogger.log.com.azure.identity";
+    System.setProperty(prop, "debug");
+    try {
+      extension.afterSessionStart(session);
+      assertEquals("debug", System.getProperty(prop));
+    } finally {
+      System.clearProperty(prop);
+    }
+  }
+
+  @Test
+  public void afterProjectsRead_installsLiveHttpHeadersConfig() throws MavenExecutionException {
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(project.getRemoteArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(project.getPluginArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
+
+    extension.afterProjectsRead(session);
+
+    Object headers = repoSession.getConfigProperties().get("aether.connector.http.headers.MyFeed");
+    assertNotNull("HTTP_HEADERS config must be installed for the ADO repo", headers);
+    assertTrue("HTTP_HEADERS value must be a Map", headers instanceof java.util.Map);
+    java.util.Map<?, ?> headerMap = (java.util.Map<?, ?>) headers;
+    java.util.Map.Entry<?, ?> entry = headerMap.entrySet().iterator().next();
+    assertEquals("Authorization", entry.getKey());
+    assertTrue(entry.getValue().toString().startsWith("Bearer "));
+  }
+
+  @Test
+  public void sharedCredential_isReusedAcrossBootAndLiveMap() throws MavenExecutionException {
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(project.getRemoteArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(project.getPluginArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
+
+    extension.afterProjectsRead(session);
+    // Boot-time getAccessToken(): 1 call. The boot fetch also pre-populates the live-path
+    // cache with the AccessToken (N3 fix) so the next entrySet() call hits the cache and
+    // doesn't fork a second `az` subprocess for AzureCliCredential.
+    verify(mockCredential, times(1)).getToken(any());
+
+    // First entrySet() call by the resolver: cache hit (boot pre-populated), still 1 total.
+    Object headers = repoSession.getConfigProperties().get("aether.connector.http.headers.MyFeed");
+    java.util.Map.Entry<?, ?> entry = ((java.util.Map<?, ?>) headers).entrySet().iterator().next();
+    assertEquals("Bearer test-token", entry.getValue());
+    verify(mockCredential, times(1)).getToken(any());
+  }
+
+  @Test
+  public void afterProjectsRead_bootFetchPrePopulatesLivePathCache()
+      throws MavenExecutionException {
+    // N3: explicit regression catcher for the boot-fetch -> live-path cache hand-off. Without
+    // the pre-populate, the first Aether HTTP request would fork a second `az` subprocess
+    // for AzureCliCredential (no SDK cache for CLI tokens). With it, we get exactly one
+    // getToken() call across boot + first 3 entrySet() requests within the cache TTL.
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("FeedA"), adoRepo("FeedB")));
+    when(project.getRemoteArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(project.getPluginArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("boot-token", OffsetDateTime.now().plusHours(1))));
+
+    extension.afterProjectsRead(session);
+
+    Object feedAHeaders =
+        repoSession.getConfigProperties().get("aether.connector.http.headers.FeedA");
+    Object feedBHeaders =
+        repoSession.getConfigProperties().get("aether.connector.http.headers.FeedB");
+    ((java.util.Map<?, ?>) feedAHeaders).entrySet().iterator().next();
+    ((java.util.Map<?, ?>) feedBHeaders).entrySet().iterator().next();
+    ((java.util.Map<?, ?>) feedAHeaders).entrySet().iterator().next();
+    // 1 boot fetch + 0 live-path fetches (all 3 entrySet calls hit the pre-populated cache).
+    verify(mockCredential, times(1)).getToken(any());
+  }
+
+  @Test
+  public void afterSessionStart_nonDefaultRepositorySession_skipsWithWarning()
+      throws MavenExecutionException {
+    // M1: a custom RepositorySystemSession (mvnd, future Maven that wraps the session,
+    // an outer extension that decorates it) must NOT cause a ClassCastException at startup.
+    // Skip the AzureDevOpsAuthSelector installation with a warning instead.
+    org.eclipse.aether.RepositorySystemSession customSession =
+        mock(org.eclipse.aether.RepositorySystemSession.class);
+    when(session.getRepositorySession()).thenReturn(customSession);
+
+    extension.afterSessionStart(session); // must NOT throw ClassCastException
+
+    // The selector path is skipped — we don't try to set it on a session we can't cast.
+    verify(customSession, never()).getAuthenticationSelector();
+  }
+
+  @Test
+  public void
+      afterProjectsRead_nonDefaultRepositorySession_skipsLiveHeadersButStillInjectsSettings()
+          throws MavenExecutionException {
+    // M1 (mirror of the afterSessionStart guard): the live-headers install path must skip
+    // cleanly if the resolver session isn't a DefaultRepositorySystemSession, BUT the boot
+    // Settings.Server fallback must continue to run — it doesn't touch the resolver session,
+    // so it's still safe and still covers ~60-75 minutes of build time on a non-Default
+    // session implementation.
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("test-token", OffsetDateTime.now().plusHours(1))));
+    when(project.getRemoteArtifactRepositories()).thenReturn(new ArrayList<>());
+    when(project.getPluginArtifactRepositories()).thenReturn(new ArrayList<>());
+    org.eclipse.aether.RepositorySystemSession customSession =
+        mock(org.eclipse.aether.RepositorySystemSession.class);
+    when(session.getRepositorySession()).thenReturn(customSession);
+
+    extension.afterProjectsRead(session); // must NOT throw ClassCastException
+
+    // (a) Live-headers install was skipped — we didn't touch the custom session's config.
+    verify(customSession, never()).getConfigProperties();
+    // (b) Boot Settings.Server fallback DID run — this is the load-bearing guarantee that
+    // short/medium builds keep working when the live-headers path isn't available. A future
+    // refactor that accidentally short-circuited the settings injection on non-Default
+    // sessions would defeat the whole point of the M1 cast-guard.
+    assertNotNull(
+        "Boot Settings.Server fallback must still inject on non-Default sessions",
+        settings.getServer("MyFeed"));
+    verify(repositorySystem, atLeastOnce()).injectAuthentication(anyList(), anyList());
   }
 
   // === helpers ===
