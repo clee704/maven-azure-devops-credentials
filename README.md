@@ -67,8 +67,8 @@ This means the extension is safe to use alongside:
 
 | Maven Version | Supported |
 |--------------|-----------|
-| 3.3.1+       | ✅ (`.mvn/extensions.xml` support) |
 | 3.0 – 3.2.x  | ❌ (no `.mvn/extensions.xml` support) |
+| 3.3.1+       | ✅ (`.mvn/extensions.xml` support) |
 | 4.x          | ⚠️ Untested. Boot-path `Settings.Server` injection should still work, but the mid-build refresh hook depends on Maven Resolver 1.x's `HttpTransporter.commonHeaders()` re-iteration contract — Resolver 2 (shipped with Maven 4) reworked the HTTP transport surface, and the live-headers path may silently fall back to boot-time-only auth there. If you run this on Maven 4, please report your results. |
 
 Compiled against Maven 3.8.x APIs. Tested on Maven 3.8.7 and later.
