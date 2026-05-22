@@ -341,6 +341,19 @@ class LiveBearerHeadersMap extends AbstractMap<String, String> {
             // same wire cost but a sane invariant.
             cachedToken.set(token);
           }
+          // N41: log the freshly-minted token's expiresAt so an operator can correlate
+          // wire-level token churn against build duration. Two distinct expiresAt values
+          // straddling a build's lifetime is direct evidence the live-refresh path fired
+          // (vs. a single mint serving every request from the steady-state cache). Counter
+          // to the silent-on-success pattern of most hot paths, this is gated to slow path
+          // only — fast-path cache hits stay silent so a build that resolves 1000 artifacts
+          // doesn't get 1000 DEBUG lines. The boot/selector path has its own
+          // "Azure Entra access token acquired successfully" DEBUG line in
+          // AzureDevOpsCredentialsExtension.getAccessToken; together they cover every
+          // production code path that calls credential.getToken().
+          logger.debug(
+              "Live-path mint: acquired Azure access token, expiresAt={}.",
+              token == null ? "null" : token.getExpiresAt());
           myFuture.complete(token);
           return token;
         } catch (RuntimeException e) {

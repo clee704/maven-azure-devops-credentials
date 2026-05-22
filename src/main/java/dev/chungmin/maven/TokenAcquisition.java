@@ -43,7 +43,40 @@ final class TokenAcquisition {
   // across the live-path cache (LiveBearerHeadersMap.acquireToken) and the boot-path
   // selector cache (AzureDevOpsAuthSelector.getAuthentication) so both code paths apply
   // the same staleness criterion.
-  private static final long TOKEN_REFRESH_BEFORE_EXPIRY_MINUTES = 5;
+  //
+  // Operator override: the `dev.chungmin.azure.refreshThresholdSeconds` system property
+  // (see refreshThresholdSeconds() below) replaces this default per Maven invocation.
+  private static final long DEFAULT_REFRESH_BEFORE_EXPIRY_SECONDS = 5 * 60;
+
+  // Operator knob: how many seconds before a cached AccessToken's expiry should our cache
+  // treat it as stale and force a fresh acquisition? Read on every isNearExpiry() call
+  // (not cached at class init) so an operator can tune behavior between Maven invocations
+  // without restarting any daemon (mvnd). Use cases:
+  //   - Increase to be more conservative on long-running daemon builds where token validity
+  //     is borderline.
+  //   - Decrease to ride tokens closer to their wire expiry (squeezes more requests out of
+  //     each token at the cost of higher 401 risk on the boundary).
+  //   - Set to a very large value during refresh-path validation tests to force every
+  //     acquireToken() call onto the slow path so each is observable in the DEBUG log.
+  // Invalid / negative values fall back to the default. The hot-path cost is a single
+  // System.getProperty() lookup per cache check (cheap; concurrent-map read in HotSpot).
+  static final String REFRESH_THRESHOLD_SECONDS_PROPERTY =
+      "dev.chungmin.azure.refreshThresholdSeconds";
+
+  static long refreshThresholdSeconds() {
+    String prop = System.getProperty(REFRESH_THRESHOLD_SECONDS_PROPERTY);
+    if (prop == null) {
+      return DEFAULT_REFRESH_BEFORE_EXPIRY_SECONDS;
+    }
+    try {
+      long parsed = Long.parseLong(prop.trim());
+      // Negative values are nonsensical (would treat future tokens as already past
+      // expiry). Fall back to default rather than guess at user intent.
+      return parsed < 0 ? DEFAULT_REFRESH_BEFORE_EXPIRY_SECONDS : parsed;
+    } catch (NumberFormatException e) {
+      return DEFAULT_REFRESH_BEFORE_EXPIRY_SECONDS;
+    }
+  }
 
   // Hard ceiling on a single token acquisition. Without this, .block() (which has no
   // implicit timeout) can hang the entire Maven build forever if anything in the credential
@@ -95,7 +128,7 @@ final class TokenAcquisition {
     return token.getExpiresAt() == null
         || token
             .getExpiresAt()
-            .isBefore(OffsetDateTime.now().plusMinutes(TOKEN_REFRESH_BEFORE_EXPIRY_MINUTES));
+            .isBefore(OffsetDateTime.now().plusSeconds(refreshThresholdSeconds()));
   }
 
   // Graceful-degradation helper: when a refresh attempt fails AND we have a cached token

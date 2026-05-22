@@ -74,4 +74,100 @@ public class TokenAcquisitionTest {
       // expected on .block(Duration) timeout
     }
   }
+
+  // N41 system property tests — refreshThresholdSeconds() is the operator knob that lets a
+  // user widen/narrow the cache near-expiry window without recompiling. Each test clears
+  // the property in @After so the JVM-wide System property doesn't leak into sibling tests
+  // (the AzureDevOpsCredentialsExtensionTest's `acquireToken_refreshesWithinExpiryWindow`
+  // mock-time test in particular assumes the default 300s threshold).
+  @org.junit.After
+  public void clearRefreshThresholdProperty() {
+    System.clearProperty(TokenAcquisition.REFRESH_THRESHOLD_SECONDS_PROPERTY);
+  }
+
+  @Test
+  public void refreshThresholdSeconds_returnsDefaultWhenPropertyUnset() {
+    System.clearProperty(TokenAcquisition.REFRESH_THRESHOLD_SECONDS_PROPERTY);
+    assertEquals(
+        "Unset property must yield the documented 5-minute (300s) default — operators who"
+            + " never set the knob should see the same behavior the constant gave before N41.",
+        300L,
+        TokenAcquisition.refreshThresholdSeconds());
+  }
+
+  @Test
+  public void refreshThresholdSeconds_acceptsValidNumericOverride() {
+    System.setProperty(TokenAcquisition.REFRESH_THRESHOLD_SECONDS_PROPERTY, "600");
+    assertEquals(
+        "A valid numeric override must be honored exactly — operators tuning for long-running"
+            + " daemon builds rely on this knob being literal seconds, not seconds-with-jitter.",
+        600L,
+        TokenAcquisition.refreshThresholdSeconds());
+  }
+
+  @Test
+  public void refreshThresholdSeconds_acceptsZeroToDisableProactiveRefresh() {
+    // 0 is a legitimate value — disables proactive refresh entirely, only refreshes on
+    // actual wire-level expiry. Documented use case: an operator who wants to minimize
+    // `az` subprocess churn at the cost of accepting occasional 401-and-retry on the
+    // expiry boundary.
+    System.setProperty(TokenAcquisition.REFRESH_THRESHOLD_SECONDS_PROPERTY, "0");
+    assertEquals(0L, TokenAcquisition.refreshThresholdSeconds());
+  }
+
+  @Test
+  public void refreshThresholdSeconds_acceptsVeryLargeOverrideForTestingForcedRefresh() {
+    // Documented refresh-validation pattern: setting the threshold to a huge value forces
+    // every isNearExpiry() check to return true, which routes every acquireToken() onto
+    // the slow path. Required to make the live-refresh path observable end-to-end in a
+    // sub-minute test (instead of waiting past the wire token's actual TTL).
+    System.setProperty(TokenAcquisition.REFRESH_THRESHOLD_SECONDS_PROPERTY, "99999999");
+    assertEquals(99999999L, TokenAcquisition.refreshThresholdSeconds());
+  }
+
+  @Test
+  public void refreshThresholdSeconds_fallsBackToDefaultOnNegativeValue() {
+    // Negative thresholds would treat already-acquired tokens as past expiry (since
+    // expiresAt.isBefore(now + (-N seconds)) flips the comparison direction). Defaulting
+    // is safer than honoring a value that can't possibly be intentional.
+    System.setProperty(TokenAcquisition.REFRESH_THRESHOLD_SECONDS_PROPERTY, "-1");
+    assertEquals(300L, TokenAcquisition.refreshThresholdSeconds());
+  }
+
+  @Test
+  public void refreshThresholdSeconds_fallsBackToDefaultOnNonNumericValue() {
+    System.setProperty(TokenAcquisition.REFRESH_THRESHOLD_SECONDS_PROPERTY, "notanumber");
+    assertEquals(300L, TokenAcquisition.refreshThresholdSeconds());
+  }
+
+  @Test
+  public void refreshThresholdSeconds_handlesWhitespaceAroundNumericValue() {
+    // -D properties on the mvn command line sometimes pick up trailing whitespace from
+    // shell substitution (e.g., "${SLEEP_SEC} " in a pom.xml). Be lenient on whitespace
+    // rather than silently dropping to the default and confusing the operator.
+    System.setProperty(TokenAcquisition.REFRESH_THRESHOLD_SECONDS_PROPERTY, "  450  ");
+    assertEquals(450L, TokenAcquisition.refreshThresholdSeconds());
+  }
+
+  @Test
+  public void isNearExpiry_honorsSystemPropertyOverride() {
+    // End-to-end verify that isNearExpiry uses refreshThresholdSeconds() — a token that
+    // expires in 10 minutes should NOT be near-expiry under the default 5-min threshold,
+    // but IS near-expiry under a widened 15-min threshold. Catches a refactor that
+    // accidentally bakes the threshold into a constant local instead of re-reading the
+    // property each call.
+    AccessToken tenMinAway = new AccessToken("t", OffsetDateTime.now().plusMinutes(10));
+    // Default (300s = 5min): 10 min from expiry is well outside the 5-min window.
+    System.clearProperty(TokenAcquisition.REFRESH_THRESHOLD_SECONDS_PROPERTY);
+    assertFalse(
+        "Default 5-min threshold must treat a 10-min-away token as fresh, otherwise we"
+            + " thrash the cache on every request.",
+        TokenAcquisition.isNearExpiry(tenMinAway));
+    // Widened (900s = 15min): 10 min from expiry is INSIDE the 15-min window → near-expiry.
+    System.setProperty(TokenAcquisition.REFRESH_THRESHOLD_SECONDS_PROPERTY, "900");
+    assertTrue(
+        "Widened 15-min threshold must treat a 10-min-away token as near-expiry — proves the"
+            + " hot-path read picks up the latest property value, not a stale class-init copy.",
+        TokenAcquisition.isNearExpiry(tenMinAway));
+  }
 }

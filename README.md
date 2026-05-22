@@ -91,6 +91,32 @@ mvn -X ...
 
 Look for log messages from `dev.chungmin.maven.AzureDevOpsCredentialsExtension`.
 
+### Tuning the proactive-refresh threshold
+
+By default the extension treats a cached Entra access token as stale once it's within 5 minutes of expiry and proactively re-acquires through the SDK on the next request. You can override that window with the `dev.chungmin.azure.refreshThresholdSeconds` system property:
+
+```bash
+# Be more conservative — refresh 10 minutes before expiry
+mvn -Ddev.chungmin.azure.refreshThresholdSeconds=600 ...
+
+# Ride tokens closer to wire expiry (fewer az subprocess forks, slightly higher 401 risk)
+mvn -Ddev.chungmin.azure.refreshThresholdSeconds=60 ...
+
+# Disable proactive refresh entirely (only refresh on actual wire expiry)
+mvn -Ddev.chungmin.azure.refreshThresholdSeconds=0 ...
+```
+
+Invalid or negative values fall back to the 300-second (5-minute) default. The setting applies to both the live-headers cache (`LiveBearerHeadersMap`) and the boot-time selector cache (`AzureDevOpsAuthSelector`), so the entire extension uses a single coherent staleness criterion.
+
+Useful debugging idiom: combine a very large threshold with `-D org.slf4j.simpleLogger.log.dev.chungmin=debug` to make every Aether HTTP request go through the slow path and log its mint:
+
+```bash
+mvn -Ddev.chungmin.azure.refreshThresholdSeconds=99999999 \
+    -Dorg.slf4j.simpleLogger.log.dev.chungmin=debug ...
+```
+
+Each request prints `Live-path mint: acquired Azure access token, expiresAt=...`. Two distinct `expiresAt` values across the build means the wire-level refresh actually fired (vs. one mint serving everything from the cache). Don't leave this on in production — every artifact download will fork a fresh `az` subprocess.
+
 ### Enabling Azure Identity DEBUG logs under mvnd
 
 This extension suppresses Azure Identity's expected `[ERROR]` failover noise (`ChainedTokenCredential` tries each provider in turn, logging an `[ERROR]` when each one rejects before the next succeeds) by setting `org.slf4j.simpleLogger.log.com.azure.identity=off` at `afterSessionStart`. Under a regular `mvn` invocation each build is a fresh JVM and any user `-D org.slf4j.simpleLogger.log.com.azure.identity=debug` override is respected (the extension's guard `if (System.getProperty(...) == null)` skips the suppression when the user already set the property).

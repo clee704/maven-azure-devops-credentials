@@ -458,7 +458,8 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     if (token == null) {
       return useFallbackOrWarnUnauthenticated(cacheRef, null);
     }
-    log.debug("Azure Entra access token acquired successfully.");
+    log.debug(
+        "Azure Entra access token acquired successfully (expiresAt={}).", token.getExpiresAt());
     if (cacheRef != null && token.getExpiresAt() != null) {
       // N15 guard, mirrored from the live-path leader: don't poison the cache with a
       // null-expiry AccessToken — both isNearExpiry() and cachedTokenIfStillRealValid()
