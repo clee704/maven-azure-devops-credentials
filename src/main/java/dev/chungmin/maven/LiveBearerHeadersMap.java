@@ -76,12 +76,16 @@ class LiveBearerHeadersMap extends AbstractMap<String, String> {
   // are treated as stale and trigger a fresh fetch.
   private final AtomicReference<AccessToken> cachedToken;
 
-  // SOLE constructor — production callers in afterProjectsRead use this directly with the
-  // extension's instance-field shared state (sharedFailureState, sharedInFlightToken,
-  // sharedCachedToken); the LiveBearerHeadersMap.forTest(...) factories below wrap this
-  // for unit tests that want subsets of the shared state with auto-allocated defaults.
-  // Keeping one constructor + named factories rather than a 1/2/3/4/5-arg telescoping
-  // chain makes the production-vs-test split visually unambiguous to a future maintainer.
+  // SOLE constructor — package-private. All non-test callers go through the named
+  // production(...) factory below, which forwards to this constructor with the extension's
+  // instance-field shared state (sharedFailureState, sharedInFlightToken, sharedCachedToken).
+  // The forTest(...) factories below also wrap this constructor, inlining their own
+  // shared-state defaults. Keeping ONE constructor + named factories — rather than a
+  // 1/2/3/4/5-arg telescoping chain — makes the production-vs-test split visually
+  // unambiguous to a future maintainer (N7 collapse + N27 forTest-naming pass). N40
+  // resync: pre-N40 this comment claimed "production callers in afterProjectsRead use
+  // this directly" — that was true before the N7/N27 factory introductions and stale
+  // afterwards. The grep target is `LiveBearerHeadersMap.production(` for the live path.
   LiveBearerHeadersMap(
       TokenCredential credential,
       Logger logger,

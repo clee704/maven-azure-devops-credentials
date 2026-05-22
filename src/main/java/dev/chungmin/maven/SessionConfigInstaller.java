@@ -87,7 +87,7 @@ final class SessionConfigInstaller {
       // decorator) could make setConfigProperty return normally without the value actually
       // landing in getConfigProperties(). Mirror the rest of the file's symmetric defensive
       // posture: one check covers every install code path.
-      verifyConfigInstalled(repoSession.getConfigProperties(), key, value);
+      verifyConfigInstalled(repoSession.getConfigProperties(), key, value, "setConfigProperty");
       return;
     } catch (IllegalStateException ignored) {
       // Maven 3.x marks the RepositorySystemSession read-only by the time afterProjectsRead
@@ -126,23 +126,33 @@ final class SessionConfigInstaller {
     // config-properties view. If a future Aether version changes the live-view contract (e.g.
     // snapshots configProperties at session-construction time), our reflective write would
     // silently no-op and the build would 401 ~75 min later with no actionable signal.
-    verifyConfigInstalled(repoSession.getConfigProperties(), key, value);
+    verifyConfigInstalled(repoSession.getConfigProperties(), key, value, "reflective put");
   }
 
   static void verifyConfigInstalled(
-      Map<String, Object> configPropertiesView, String key, Object value) {
+      Map<String, Object> configPropertiesView, String key, Object value, String installPath) {
     // Reference equality is what we actually care about: did the same LiveBearerHeadersMap
     // instance we wrote show up in the view? Using Objects.equals here would dispatch to
     // AbstractMap.equals on a mismatch, which calls size() -> entrySet() -> credential.getToken()
     // — an unwanted side effect during what is supposed to be a passive diagnostic.
     if (configPropertiesView.get(key) != value
         && verificationFailureLogged.compareAndSet(false, true)) {
+      // N39: include `installPath` in the message so a user reading the diagnostic knows
+      // which install code path was responsible. Pre-N39 this message was hard-coded to
+      // "Reflective install of '{}' completed..." — accurate when the post-install check
+      // only ran on the reflective-fallback branch, but misleading after S1 mirrored the
+      // check onto the public-API success path. A future custom DefaultRepositorySystemSession
+      // subclass (mvnd, an outer extension, a profile-decorator) that silent-no-ops
+      // setConfigProperty would have shown "Reflective install..." to a user who never
+      // executed any reflection — chasing the wrong root cause. The discriminator string
+      // ("setConfigProperty" or "reflective put") matches what a maintainer would grep for
+      // when triaging.
       log.error(
-          "Reflective install of '{}' completed but value is not visible via"
-              + " getConfigProperties(); mid-build token refresh may not take effect."
-              + " Subsequent feeds in this build will fail identically; suppressing further"
-              + " error logs.",
-          key);
+          "Install of '{}' via {} completed but value is not visible via getConfigProperties();"
+              + " mid-build token refresh may not take effect. Subsequent feeds in this build"
+              + " will fail identically; suppressing further error logs.",
+          key,
+          installPath);
     }
   }
 }

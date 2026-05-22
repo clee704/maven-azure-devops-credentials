@@ -81,17 +81,19 @@ public class SessionConfigInstallerTest {
 
     // Match path (value visible): no-op — gate must stay clear.
     SessionConfigInstaller.verifyConfigInstalled(
-        java.util.Collections.singletonMap("k3", (Object) "v3"), "k3", "v3");
+        java.util.Collections.singletonMap("k3", (Object) "v3"), "k3", "v3", "setConfigProperty");
     assertFalse("Match path must not trip the gate", gate.get());
 
     // First mismatch: gate flips (and the log.error fires; we don't intercept stderr here
     // because the JaCoCo coverage check + the gate transition together pin the behavior).
-    SessionConfigInstaller.verifyConfigInstalled(java.util.Collections.emptyMap(), "k3", "v3");
+    SessionConfigInstaller.verifyConfigInstalled(
+        java.util.Collections.emptyMap(), "k3", "v3", "setConfigProperty");
     assertTrue("First mismatch must trip the rate-limit gate", gate.get());
 
     // Second mismatch: gate stays flipped (compareAndSet(false, true) returns false, log
     // call is skipped). A regression that removed the gate would silently re-log here.
-    SessionConfigInstaller.verifyConfigInstalled(java.util.Collections.emptyMap(), "k4", "v4");
+    SessionConfigInstaller.verifyConfigInstalled(
+        java.util.Collections.emptyMap(), "k4", "v4", "reflective put");
     assertTrue("Gate must stay flipped on second mismatch (rate-limit invariant)", gate.get());
   }
 
