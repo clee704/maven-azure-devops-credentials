@@ -445,17 +445,18 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     try {
       token = TokenAcquisition.blockForToken(credential);
     } catch (RuntimeException e) {
-      // N20: passing `e` as the trailing arg attaches the stack trace via SLF4J's
-      // parameterized API (last arg is treated as Throwable when there are more args than
-      // placeholders). Without it, users debugging "tokens stopped working" who enable -X
-      // get only the e.toString() — no JDK frame pointing at the actual Azure SDK / network
-      // / process-spawn failure inside blockForToken. Matches the shape N11 introduced for
-      // installSessionConfig and N9 confirmed for LiveBearerHeadersMap.noteFailure.
+      // DEBUG line gives users running -X the full stack trace + e.toString() inline,
+      // including on the subsequent-failures-suppressed-by-gate calls where the WARN
+      // doesn't fire. Threading `e` through to useFallbackOrWarnUnauthenticated (N38)
+      // also attaches the stack trace to the first WARN so default-verbosity users get
+      // the same diagnostic depth as live-path failures (where noteFailure already does
+      // this — N20 established the pattern for the file; this is the last site that
+      // didn't follow it).
       log.debug("Token acquisition error: {}", e.toString(), e);
-      return useFallbackOrWarnUnauthenticated(cacheRef);
+      return useFallbackOrWarnUnauthenticated(cacheRef, e);
     }
     if (token == null) {
-      return useFallbackOrWarnUnauthenticated(cacheRef);
+      return useFallbackOrWarnUnauthenticated(cacheRef, null);
     }
     log.debug("Azure Entra access token acquired successfully.");
     if (cacheRef != null && token.getExpiresAt() != null) {
@@ -469,7 +470,8 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     return token.getToken();
   }
 
-  private String useFallbackOrWarnUnauthenticated(AtomicReference<AccessToken> cacheRef) {
+  private String useFallbackOrWarnUnauthenticated(
+      AtomicReference<AccessToken> cacheRef, Throwable cause) {
     if (cacheRef != null) {
       // Capture the cached AccessToken before the validity check so we can log its expiry
       // timestamp on the fallback-served debug line (matches the live-path's
@@ -489,8 +491,17 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     if (sharedFailureState.compareAndSet(false, true)) {
       // The DefaultAzureCredentialBuilder chain in createCredential() tries Azure CLI,
       // environment variables, and Managed Identity in order. Steer the user toward the
-      // most common remediation for each instead of assuming CLI is the only path.
-      log.warn("Failed to acquire Azure access token. " + CREDENTIAL_FAILURE_REMEDIATION);
+      // most common remediation for each instead of assuming CLI is the only path. When a
+      // RuntimeException caused the failure (N38), attach it as the trailing SLF4J arg so
+      // the stack trace prints inline with the WARN — same shape as
+      // LiveBearerHeadersMap.noteFailure (the N20 pattern). The Mono.empty() branch has no
+      // cause to attach, so we call the 1-arg warn(String).
+      String message = "Failed to acquire Azure access token. " + CREDENTIAL_FAILURE_REMEDIATION;
+      if (cause == null) {
+        log.warn(message);
+      } else {
+        log.warn(message, cause);
+      }
     }
     return null;
   }
