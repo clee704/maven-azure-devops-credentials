@@ -78,7 +78,8 @@ Java 8 or higher is required.
 
 - Only supports Azure DevOps Services (cloud). Azure DevOps Server (on-premises) is not supported, as it uses custom domains that cannot be auto-detected.
 - Plugins or transports that bypass Aether and read `<server>` passwords directly (e.g. `wagon-http`) see only the boot-time token, which is not refreshed mid-build. Mid-build token refresh covers everything that flows through Aether's `HttpTransporter` — the standard Maven Resolver HTTP layer used by Maven 3.3+ for dependency, plugin, and metadata fetches, and by `mvn deploy` for uploads.
-- Mid-build refresh depends on Maven Resolver's `HttpTransporter` re-reading the `HTTP_HEADERS` Map's `entrySet()` on every request (true through maven-resolver 1.x; verified inline at `LiveBearerHeadersMap`'s Javadoc). If a future Aether version snapshots the headers at construction time instead, the feature will silently fall back to boot-time-only auth — long builds would 401 after token expiry with no error. If you're troubleshooting "tokens aren't refreshing" after a Maven/Aether bump, check the value-type dispatch in `HttpTransporter.commonHeaders()` first.
+- Mid-build refresh depends on Maven Resolver's `HttpTransporter` re-reading the `HTTP_HEADERS` Map's `entrySet()` on every request (true through maven-resolver 1.x; verified inline at `LiveBearerHeadersMap`'s Javadoc, and asserted by a unit test against the same `ConfigUtils.getMap` call site Aether uses internally). If a future Aether version snapshots the headers at construction time instead, the feature will silently fall back to boot-time-only auth — long builds would 401 after token expiry with no error. If you're troubleshooting "tokens aren't refreshing" after a Maven/Aether bump, check the value-type dispatch in `HttpTransporter.commonHeaders()` first.
+- Installing the per-repo `aether.connector.http.headers.<repoId>` Map displaces any pre-existing per-repo or global `HTTP_HEADERS` config for that feed. Aether's `ConfigUtils.getMap` returns the first matching key without merging, so a global `-Daether.connector.http.headers.X-Build-Id=foo` (or similar) flows on non-ADO requests but is silently shadowed on the ADO feeds this extension installs onto. Rare in practice — typical users of this extension don't set custom HTTP_HEADERS — but worth knowing if your build pipeline relies on a global header reaching ADO requests.
 
 ## Troubleshooting
 
@@ -89,6 +90,15 @@ mvn -X ...
 ```
 
 Look for log messages from `dev.chungmin.maven.AzureDevOpsCredentialsExtension`.
+
+### Enabling Azure Identity DEBUG logs under mvnd
+
+This extension suppresses Azure Identity's expected `[ERROR]` failover noise (`ChainedTokenCredential` tries each provider in turn, logging an `[ERROR]` when each one rejects before the next succeeds) by setting `org.slf4j.simpleLogger.log.com.azure.identity=off` at `afterSessionStart`. Under a regular `mvn` invocation each build is a fresh JVM and any user `-D org.slf4j.simpleLogger.log.com.azure.identity=debug` override is respected (the extension's guard `if (System.getProperty(...) == null)` skips the suppression when the user already set the property).
+
+Under Maven Daemon (`mvnd`), the JVM persists across builds and SLF4J SimpleLogger caches each logger's level at FIRST creation. If the daemon's first build set the property to `off`, subsequent `mvnd -D org.slf4j.simpleLogger.log.com.azure.identity=debug` invocations have no effect on already-cached `com.azure.identity.*` loggers. To enable DEBUG under mvnd:
+
+- Set `-D org.slf4j.simpleLogger.log.com.azure.identity=debug` on the **first** invocation of the daemon (before it caches the level), OR
+- Run `mvnd --stop` first to terminate the daemon, then start a new daemon with the `-D` set.
 
 ## License
 

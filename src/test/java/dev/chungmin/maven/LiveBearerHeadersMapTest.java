@@ -809,4 +809,55 @@ public class LiveBearerHeadersMapTest {
     // blockForToken (i.e., for AzureCliCredential, the redundant `az` subprocess fork).
     verify(mockCredential, never()).getToken(any());
   }
+
+  @Test
+  public void aetherContract_configUtilsGetMapReturnsLiveReferenceNotSnapshot() {
+    // N35 regression catcher: the entire mid-build refresh mechanism rests on the
+    // load-bearing assumption that maven-resolver's ConfigUtils.getMap() returns the
+    // installed map BY REFERENCE — not a snapshot taken at install time. If a future
+    // Aether bump silently changes that contract (e.g. defensive-copying configProperties
+    // for thread safety, or freezing the headers at session construction), every existing
+    // unit test still passes and JaCoCo still reports 100% coverage, but `mvn verify`
+    // against a real ADO feed silently reverts to boot-time-only auth and 401s ~75
+    // minutes in — exactly the silent-fallback failure mode the README Limitations
+    // section warns about.
+    //
+    // This test pins the contract at unit-test speed: install a LiveBearerHeadersMap,
+    // look it up via ConfigUtils.getMap (the same call site Aether's HttpTransporter uses
+    // internally), and assert (a) the returned Map is reference-equal to the installed
+    // map (no snapshot) and (b) iterating its entrySet() actually invokes our
+    // LiveBearerHeadersMap.entrySet() — proving the live-Map dispatch fires.
+    when(mockCredential.getToken(any()))
+        .thenReturn(
+            Mono.just(new AccessToken("contract-token", OffsetDateTime.now().plusHours(1))));
+
+    org.eclipse.aether.DefaultRepositorySystemSession session =
+        new org.eclipse.aether.DefaultRepositorySystemSession();
+    LiveBearerHeadersMap installed = LiveBearerHeadersMap.forTest(mockCredential);
+    SessionConfigInstaller.installSessionConfig(
+        session, org.eclipse.aether.ConfigurationProperties.HTTP_HEADERS + ".MyFeed", installed);
+
+    java.util.Map<?, ?> retrieved =
+        org.eclipse.aether.util.ConfigUtils.getMap(
+            session,
+            null,
+            org.eclipse.aether.ConfigurationProperties.HTTP_HEADERS + ".MyFeed",
+            org.eclipse.aether.ConfigurationProperties.HTTP_HEADERS);
+
+    // Contract (a): must be the same reference, not a snapshot
+    assertSame(
+        "Aether's ConfigUtils.getMap must return the installed LiveBearerHeadersMap by "
+            + "reference, not a snapshot. If a future Aether bump snapshots HTTP_HEADERS at "
+            + "install time, the live-headers mid-build refresh mechanism silently reverts "
+            + "to boot-time-only auth (no exception, 401s after token expiry).",
+        installed,
+        retrieved);
+
+    // Contract (b): iterating retrieved.entrySet() actually invokes the live-Map dispatch
+    // through LiveBearerHeadersMap.entrySet() — which triggers credential.getToken() (with
+    // M1's cache absorbing subsequent calls). Verifying getToken was called exactly once
+    // proves the entry was fetched live, not served from a frozen snapshot.
+    retrieved.entrySet();
+    verify(mockCredential, times(1)).getToken(any());
+  }
 }

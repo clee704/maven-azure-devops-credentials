@@ -174,6 +174,14 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // current Maven 3.x lifecycle. If a future Maven version moves extension activation later
     // than first-logger-creation, the property write would be too late and azure-identity ERROR
     // logs would resurface — at which point the user can set the property via -D or settings.
+    //
+    // mvnd caveat (N34): under Maven Daemon, the JVM persists across builds. SLF4J
+    // SimpleLogger reads this property at FIRST logger creation in the daemon's lifetime
+    // and caches the level per-logger; subsequent invocations' -D overrides have no effect
+    // on already-cached loggers. So under mvnd, the "preserve any user override" promise
+    // above only holds for users who set `-D org.slf4j.simpleLogger.log.com.azure.identity=
+    // debug` on the FIRST daemon invocation (or after `mvnd --stop`). The README's
+    // Troubleshooting section documents this for users hitting the surprise.
     if (System.getProperty(AZURE_IDENTITY_LOG_PROPERTY) == null) {
       System.setProperty(AZURE_IDENTITY_LOG_PROPERTY, "off");
     }
