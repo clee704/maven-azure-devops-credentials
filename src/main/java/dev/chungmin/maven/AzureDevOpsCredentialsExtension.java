@@ -299,9 +299,19 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
       token = getAccessToken(credential, sharedCachedToken);
     }
     if (token == null) {
-      log.warn(
-          "Failed to acquire initial Azure access token. Live header refresh will retry per request, "
-              + "but legacy/Wagon paths may not be authenticated.");
+      // N37: no boot-path-specific WARN here. getAccessToken's
+      // useFallbackOrWarnUnauthenticated has already fired the gated root-cause WARN ("Failed
+      // to acquire Azure access token. Tried Azure CLI, ... Try `az login` locally...") which
+      // contains the actionable remediation. The previous boot-path WARN here ("Live header
+      // refresh will retry per request, but legacy/Wagon paths may not be authenticated") was
+      // additive noise — every boot-fail produced both, and the consequence info is implicit
+      // in context (if you can't auth at boot, neither Settings.Server-based legacy nor the
+      // live-headers path will work until the next successful refresh). DEBUG retains the
+      // detail for users running -X who want the breakdown.
+      log.debug(
+          "Boot-time Azure access token unavailable. Live-headers path will retry per"
+              + " outbound HTTP request; Wagon/legacy transports won't be authenticated"
+              + " until the next successful refresh.");
       return;
     }
 
