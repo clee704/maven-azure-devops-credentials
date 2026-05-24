@@ -21,15 +21,24 @@ import com.azure.identity.AzureCliCredentialBuilder;
 import com.azure.identity.ChainedTokenCredentialBuilder;
 import com.azure.identity.EnvironmentCredentialBuilder;
 import com.azure.identity.ManagedIdentityCredentialBuilder;
+import java.io.IOException;
+import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.inject.Inject;
@@ -43,6 +52,9 @@ import org.apache.maven.project.MavenProject;
 import org.apache.maven.repository.RepositorySystem;
 import org.apache.maven.settings.Server;
 import org.apache.maven.settings.Settings;
+import org.apache.maven.settings.crypto.DefaultSettingsDecryptionRequest;
+import org.apache.maven.settings.crypto.SettingsDecrypter;
+import org.apache.maven.settings.crypto.SettingsDecryptionResult;
 import org.eclipse.aether.ConfigurationProperties;
 import org.eclipse.aether.DefaultRepositorySystemSession;
 import org.eclipse.aether.repository.AuthenticationSelector;
@@ -93,6 +105,56 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
           + " assignment on this host."
           + " Subsequent failures will be suppressed until the next successful refresh.";
 
+  /**
+   * System property / POM property controlling whether existing {@code <server>} entries in {@code
+   * ~/.m2/settings.xml} are probed against the feed before being trusted.
+   *
+   * <p>Values (case-insensitive):
+   *
+   * <ul>
+   *   <li><b>{@code auto}</b> (default) — probe each entry with a HEAD request. On 401, acquire an
+   *       Entra token and Bearer-verify it works for the feed: if so, override the entry; if the
+   *       new token also returns 401 against the feed (e.g., Managed Identity without ADO role),
+   *       keep the stale entry and log INFO about the Entra-identity scope; if Entra is unreachable
+   *       at all, keep the stale entry and log INFO with the {@code az login} remediation. See
+   *       README "Credential precedence" matrix for the full decision table.
+   *   <li><b>{@code always}</b> — probe; on 401, override unconditionally when Entra returns a
+   *       token (regardless of whether that token works for the feed), keeping the stale entry only
+   *       when Entra acquisition itself fails (no token to override with). The {@code
+   *       useFallbackOrWarnUnauthenticated} WARN surfaces in that case.
+   *   <li><b>{@code never}</b> — pre-0.0.8 behavior; trust settings.xml entries without probing.
+   * </ul>
+   *
+   * <p>Configurable as {@code -D}, in {@code .mvn/maven.config}, as a POM {@code <properties>}
+   * entry, or via {@code MAVEN_OPTS}. Resolution order: user properties ({@code -D} + {@code
+   * .mvn/maven.config}) → system properties ({@code MAVEN_OPTS}) → POM {@code <properties>} →
+   * default. See {@link #resolveValidationMode} for the precedence details and the rationale for
+   * checking both {@code session.getUserProperties()} and {@code session.getSystemProperties()}.
+   */
+  static final String VALIDATE_PROPERTY = "dev.chungmin.azure.validateExistingCredentials";
+
+  static final String VALIDATE_AUTO = "auto";
+  static final String VALIDATE_ALWAYS = "always";
+  static final String VALIDATE_NEVER = "never";
+
+  /**
+   * System property controlling the connect/read timeout (milliseconds) used by {@link
+   * #probeStatus} on the HEAD probe against the feed. Defaults to {@link
+   * #DEFAULT_PROBE_TIMEOUT_MILLIS} (5 s). Cross-region ADO traffic on a high-latency CI agent can
+   * exceed the default — without an override, a healthy probe would time out, {@code probeStatus}
+   * would return 0, and the caller would silently behave as if {@code validateExistingCredentials}
+   * were {@code never} (entry trusted as-is). Set this higher on slow networks. Invalid or
+   * non-positive values fall back to the default.
+   *
+   * <p>Honors the same 4-channel precedence as {@link #VALIDATE_PROPERTY}: user properties ({@code
+   * -D} + {@code .mvn/maven.config}) → system properties ({@code MAVEN_OPTS} + JVM args) → POM
+   * {@code <properties>} on the root project → {@code System.getProperty} fallback. See {@link
+   * #resolveProbeTimeoutMillis} for the resolver implementation.
+   */
+  static final String PROBE_TIMEOUT_PROPERTY = "dev.chungmin.azure.probeTimeoutMillis";
+
+  static final int DEFAULT_PROBE_TIMEOUT_MILLIS = 5000;
+
   // Inner-tier subprocess timeout for AzureCliCredential. Sits between "fast happy path"
   // (typical `az account get-access-token` is <5s on a warm system) and the outer
   // TokenAcquisition.TOKEN_ACQUISITION_TIMEOUT (2min, the absolute ceiling that covers
@@ -109,6 +171,24 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   private static final Duration CLI_PROCESS_TIMEOUT = Duration.ofSeconds(60);
 
   @Inject private RepositorySystem repositorySystem;
+
+  /**
+   * Decrypts {@code <server>} entries that use the master-password mechanism (encrypted tokens
+   * stored as {@code {...}} in settings.xml, with the key derived from {@code
+   * ~/.m2/settings-security.xml}). Without decryption, a stale-probe with the raw encrypted literal
+   * as the Basic password would always 401 — falsely classifying encrypted-but-valid entries as
+   * stale. Lazily resolved by Plexus DI; null when running outside a full Maven container (most
+   * unit tests), in which case {@link #decryptPassword} falls back to {@link Server#getPassword()}
+   * unchanged.
+   */
+  @Inject private SettingsDecrypter settingsDecrypter;
+
+  /**
+   * Per-build cache of stale-probe verdicts, keyed by repository ID. A multi-module Maven build
+   * with N modules pointing at the same Azure DevOps feed probes once. Cleared at {@link
+   * #afterSessionStart} for {@code mvnd}'s reused JVM.
+   */
+  private final ConcurrentMap<String, Boolean> probeCache = new ConcurrentHashMap<>();
 
   // Shared AccessToken cache, populated by the boot fetch in afterProjectsRead and read by
   // both the live-path entrySet() callback (LiveBearerHeadersMap) and the boot-path selector
@@ -161,6 +241,10 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // would see the previous build's potentially-expired token and skip the fresh fetch.
     sharedCachedToken.set(null);
     sharedFailureState.set(false);
+    // Per-build reset of the stale-probe cache for mvnd. Same rationale as above:
+    // a stale verdict from a previous build (e.g., the user rotated their PAT
+    // between builds) must not stick in the cache across the JVM's lifetime.
+    probeCache.clear();
     // Suppress noisy [ERROR] messages from ChainedTokenCredential trying each credential provider
     // in turn. SLF4J SimpleLogger (Maven's default binding) reads this property when the
     // com.azure.identity logger is first created, so setting it once here covers every later
@@ -210,10 +294,19 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   public void afterProjectsRead(MavenSession session) throws MavenExecutionException {
     Settings settings = session.getSettings();
     Set<String> repoIds = new LinkedHashSet<>();
+    // Stale-entry tracking: repoId -> reference to the existing Server entry in
+    // settings.xml that returned 401. We DON'T mutate these now; we wait for token
+    // acquisition to succeed first (per the design: never delete a user's settings
+    // entry without a working replacement). After eager token fetch, we mutate the
+    // password in-place if `token != null`; if it's null, we log a diagnostic and
+    // leave the stale entry untouched (degrading to pre-0.0.8 behavior).
+    Map<String, Server> staleEntries = new LinkedHashMap<>();
 
     for (MavenProject project : session.getProjects()) {
-      collectAzureDevOpsRepoIds(project.getRepositories(), settings, repoIds);
-      collectAzureDevOpsRepoIds(project.getPluginRepositories(), settings, repoIds);
+      collectAzureDevOpsRepoIds(
+          project.getRepositories(), settings, repoIds, staleEntries, session);
+      collectAzureDevOpsRepoIds(
+          project.getPluginRepositories(), settings, repoIds, staleEntries, session);
     }
 
     if (repoIds.isEmpty()) {
@@ -291,13 +384,7 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
     // reuse it instead of forking a second `az` subprocess. Otherwise fetch (and the 2-arg
     // overload populates sharedCachedToken so the live-path entrySet() and any subsequent
     // selector call also hit the cache).
-    String token;
-    AccessToken cached = sharedCachedToken.get();
-    if (cached != null && !TokenAcquisition.isNearExpiry(cached)) {
-      token = cached.getToken();
-    } else {
-      token = getAccessToken(credential, sharedCachedToken);
-    }
+    String token = getCachedOrFreshAccessToken(credential);
     if (token == null) {
       // N37: no boot-path-specific WARN here. getAccessToken's
       // useFallbackOrWarnUnauthenticated has already fired the gated root-cause WARN ("Failed
@@ -312,18 +399,45 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
           "Boot-time Azure access token unavailable. Live-headers path will retry per"
               + " outbound HTTP request; Wagon/legacy transports won't be authenticated"
               + " until the next successful refresh.");
+      if (!staleEntries.isEmpty()) {
+        // Stale entries are still in settings.xml unchanged. The build will likely fail
+        // with 401 against the feed — give the user the diagnostic signal so they don't
+        // have to debug "why does mvn fail when my settings.xml looks right?".
+        for (String id : staleEntries.keySet()) {
+          log.info(
+              "Repository '{}' settings.xml credentials returned 401, but Entra is also"
+                  + " unreachable. Build will likely fail with 401. Run `az login` or"
+                  + " configure AZURE_CLIENT_ID to enable automatic credential refresh.",
+              id);
+        }
+      }
       return;
     }
 
     List<Server> newServers = new ArrayList<>();
     for (String repoId : repoIds) {
-      Server server = new Server();
-      server.setId(repoId);
-      server.setUsername("azure");
-      server.setPassword(token);
-      settings.addServer(server);
-      newServers.add(server);
-      log.info("Injected Azure Entra credentials for repository '{}'.", repoId);
+      Server stale = staleEntries.get(repoId);
+      if (stale != null) {
+        // Mutate the existing settings.xml entry in-place so other Maven internals that
+        // read Settings.getServer(repoId) — wagon-http, maven-deploy-plugin's distribution
+        // management, maven-site-plugin, maven-scm-plugin — see the fresh token. We mutate
+        // the same Server object reference; the new password takes effect immediately for
+        // any subsequent settings.getServer(id).getPassword() lookup.
+        stale.setPassword(token);
+        newServers.add(stale);
+        log.info(
+            "Overrode stale settings.xml credentials for repository '{}' with a fresh"
+                + " Entra token (existing entry returned 401 to the probe).",
+            repoId);
+      } else {
+        Server server = new Server();
+        server.setId(repoId);
+        server.setUsername("azure");
+        server.setPassword(token);
+        settings.addServer(server);
+        newServers.add(server);
+        log.info("Injected Azure Entra credentials for repository '{}'.", repoId);
+      }
     }
 
     // Use Maven's own RepositorySystem.injectAuthentication() to set auth on the
@@ -340,26 +454,441 @@ public class AzureDevOpsCredentialsExtension extends AbstractMavenLifecycleParti
   }
 
   private void collectAzureDevOpsRepoIds(
-      List<Repository> repositories, Settings settings, Set<String> repoIds) {
+      List<Repository> repositories,
+      Settings settings,
+      Set<String> repoIds,
+      Map<String, Server> staleEntries,
+      MavenSession session) {
     if (repositories == null) {
       return;
     }
     for (Repository repo : repositories) {
-      if (settings.getServer(repo.getId()) != null) {
-        log.debug(
-            "Repository '{}' already has credentials in settings.xml, skipping.", repo.getId());
-        continue;
-      }
+      // Mirror check FIRST: if this repo is covered by a mirror with credentials,
+      // Aether will resolve through the mirror (not this repo's <server>) so any
+      // staleness of this repo's entry is irrelevant. Doing the mirror check
+      // before probing avoids two HTTP round-trips per mirror-covered stale repo,
+      // AND prevents the no-token-but-stale diagnostic from claiming "Build will
+      // likely fail with 401" for a repo the mirror would have handled.
       if (isMirroredWithCredentials(repo.getId(), settings)) {
         log.debug(
             "Repository '{}' is covered by a mirror with credentials, skipping.", repo.getId());
         continue;
+      }
+      Server existing = settings.getServer(repo.getId());
+      if (existing != null) {
+        if (existingServerUsable(repo, existing, session)) {
+          log.debug(
+              "Repository '{}' already has credentials in settings.xml, skipping.", repo.getId());
+          continue;
+        }
+        // Stale — track for post-token-acquisition override. We still need to fall
+        // through to `repoIds.add(...)` below so the live HTTP_HEADERS gets installed
+        // for this feed, exactly as for a no-entry repo.
+        staleEntries.put(repo.getId(), existing);
+        log.debug(
+            "Repository '{}' settings.xml credentials look stale; queuing for override.",
+            repo.getId());
       }
       if (isAzureDevOpsUrl(repo.getUrl())) {
         repoIds.add(repo.getId());
         log.debug("Found Azure DevOps feed '{}' at {}.", repo.getId(), repo.getUrl());
       }
     }
+  }
+
+  /**
+   * Resolve the validation-mode setting for this session. Precedence (highest first):
+   *
+   * <ol>
+   *   <li>User properties: {@code -D} on the command line, or {@code .mvn/maven.config} (both flow
+   *       into {@link MavenSession#getUserProperties()}).
+   *   <li>System properties: JVM-level {@code -D} flags set before Maven's CLI parser runs — which
+   *       is how {@code MAVEN_OPTS="-D..."} (and a wrapper script that pre-sets the JVM property)
+   *       reaches us. Maven's {@code MavenCli.populateProperties} captures these into {@link
+   *       MavenSession#getSystemProperties()} but explicitly does NOT mirror them into
+   *       user-properties, so {@code MAVEN_OPTS}-set values would silently fall through to the
+   *       default without this fallback. Verified against {@code MavenCli.java} (maven-3.9.9).
+   *   <li>Root project POM {@code <properties>}.
+   *   <li>Default: {@link #VALIDATE_AUTO}.
+   * </ol>
+   *
+   * <p>POM {@code <properties>} are read from the root project (not {@link
+   * MavenSession#getCurrentProject()}, which can be a transient null at this lifecycle stage).
+   * Using a per-module property to vary validation behavior would be confusing anyway — the
+   * property is build-global by intent.
+   */
+  String resolveValidationMode(MavenSession session) {
+    String v = session.getUserProperties().getProperty(VALIDATE_PROPERTY);
+    if (v == null) {
+      // MAVEN_OPTS path — MavenCli copies JVM system properties into systemProperties but
+      // not into userProperties, so we must check both to honor MAVEN_OPTS=-D... as advertised.
+      java.util.Properties sysProps = session.getSystemProperties();
+      if (sysProps != null) {
+        v = sysProps.getProperty(VALIDATE_PROPERTY);
+      }
+    }
+    if (v == null) {
+      List<MavenProject> projects = session.getProjects();
+      if (projects != null && !projects.isEmpty()) {
+        v = projects.get(0).getProperties().getProperty(VALIDATE_PROPERTY);
+      }
+    }
+    return normalizeMode(v);
+  }
+
+  private static String normalizeMode(String v) {
+    if (v == null) {
+      return VALIDATE_AUTO;
+    }
+    String lc = v.trim().toLowerCase();
+    if (VALIDATE_ALWAYS.equals(lc)) {
+      return VALIDATE_ALWAYS;
+    }
+    if (VALIDATE_NEVER.equals(lc)) {
+      return VALIDATE_NEVER;
+    }
+    return VALIDATE_AUTO;
+  }
+
+  /**
+   * Whether the existing settings.xml entry for {@code repo} should be trusted as-is. Wraps {@link
+   * #probeStatus} + mode-aware policy + per-build cache.
+   */
+  private boolean existingServerUsable(Repository repo, Server server, MavenSession session) {
+    String mode = resolveValidationMode(session);
+    // NEVER short-circuits here (before the probe) because it explicitly opts out of all
+    // network IO — the user has asked us to behave like 0.0.7. ALWAYS and AUTO both need
+    // the probe to reach probeAndDecide before they can decide; their mode-specific
+    // branching lives inside probeAndDecide after the probe result is known.
+    if (VALIDATE_NEVER.equals(mode)) {
+      return true;
+    }
+    if (!isAzureDevOpsUrl(repo.getUrl())) {
+      // Non-ADO host — we have no Entra fallback for it, so trusting the user's
+      // explicit settings entry is the only sensible behavior.
+      return true;
+    }
+    Boolean cached = probeCache.get(repo.getId());
+    if (cached != null) {
+      return cached.booleanValue();
+    }
+    boolean usable = probeAndDecide(repo, server, mode, session);
+    probeCache.put(repo.getId(), usable);
+    return usable;
+  }
+
+  /**
+   * Real probe + decision logic, split out so {@link #existingServerUsable} stays a one-liner
+   * around the cache lookup.
+   */
+  private boolean probeAndDecide(
+      Repository repo, Server server, String mode, MavenSession session) {
+    String password = decryptPassword(server);
+    if (password == null) {
+      // decryptPassword returned null. Two distinct paths reach here, both terminal:
+      // (a) Decryption failed with ERROR/FATAL severity — a WARN naming the decryption
+      //     error was logged at the failure site. We must not probe (sending the
+      //     still-encrypted literal as Basic auth would falsely 401), and must not
+      //     classify as stale (an auto-mode override would silently paper over the
+      //     user's broken settings-security.xml with an Entra token under a different
+      //     identity). Trust the entry so Maven's own decryption attempt at fetch time
+      //     produces the canonical error message that points the user at the real
+      //     config problem.
+      // (b) Pass-through of a null source password — the <server> entry has no
+      //     <password> element (or Server#getPassword() is otherwise null and the
+      //     decrypter returned a null/no-password server). No WARN fires for this
+      //     path; the entry simply has nothing to send. Sending "Basic <user>:" with
+      //     an empty password would falsely 401 and trigger a misleading "Overrode
+      //     stale" log; treating as not-stale leaves the empty entry intact so
+      //     downstream auth fails with Maven's own clearer "no password configured"
+      //     surface.
+      return true;
+    }
+    int status =
+        probeStatus(repo.getUrl(), "Basic " + basicAuth(server.getUsername(), password), session);
+    if (status != 401) {
+      // 2xx / 3xx / 4xx-non-401 / 5xx / network error: trust the entry. Most ADO feed
+      // roots return 404 (not 200) to a valid-auth HEAD, so we cannot distinguish
+      // "auth worked" from "feed deleted/renamed" by status alone — and silently
+      // overriding a misconfigured feed URL would mask the real problem. Stale-PAT
+      // detection is the feature's scope; broken-feed detection is not.
+      return true;
+    }
+    if (VALIDATE_ALWAYS.equals(mode)) {
+      return false;
+    }
+    // auto: only override if Entra is actually reachable. Use the cache-aware
+    // helper so multiple stale repos in the same build don't re-fork `az`
+    // (AzureCliCredential has no SDK cache).
+    //
+    // Fast-path: if a prior call in THIS build already failed Entra acquisition
+    // (sharedFailureState set by useFallbackOrWarnUnauthenticated), skip the
+    // retry — without this gate, N stale entries with `az login` expired would
+    // re-fork `az` N times (cache only populates on success). The first call's
+    // WARN already informed the user; subsequent stale repos just log INFO and
+    // keep the entry. sharedFailureState is reset on the next success (any
+    // path) AND per-build in afterSessionStart, so this doesn't block mid-build
+    // recovery — only the per-build initial probe burst.
+    if (sharedCachedToken.get() == null && sharedFailureState.get()) {
+      log.info(
+          "Repository '{}' settings.xml credentials returned 401; a prior Entra acquisition"
+              + " in this build already failed, skipping retry. Build will likely fail with"
+              + " 401. Run `az login` or configure AZURE_CLIENT_ID to enable automatic"
+              + " credential refresh.",
+          repo.getId());
+      return true;
+    }
+    String token = getCachedOrFreshAccessToken(getSharedCredential());
+    if (token == null) {
+      log.info(
+          "Repository '{}' settings.xml credentials returned 401, but Entra is also"
+              + " unreachable. Build will likely fail with 401. Run `az login` or"
+              + " configure AZURE_CLIENT_ID to enable automatic credential refresh.",
+          repo.getId());
+      return true; // entry "usable" → keep it (no replacement available)
+    }
+    // Second-pass verification: does the fresh Entra token actually work for
+    // THIS feed? On Azure VMs with Managed Identity, getAccessToken often
+    // succeeds via MI even when AzureCli is unavailable — but the MI may
+    // lack access to the feed the user's PAT was scoped to. Overriding the
+    // stale PAT with a no-access MI token leaves the build still failing
+    // with 401, plus a misleading "Overrode stale" log. Verify first.
+    //
+    // Treat both 401 (no/invalid auth) and 403 (auth recognized but not
+    // authorized) as "this token can't access the feed" — ADO Maven feeds
+    // empirically return 401 for missing role today, but the matrix becomes
+    // inconsistent if that ever changes to 403 (which is what an HTTP-layer
+    // authorization service would naturally return). Treating both as
+    // no-access keeps the "never override unless Entra demonstrably works"
+    // contract robust across either ADO behavior.
+    int verifyStatus = probeStatus(repo.getUrl(), "Bearer " + token, session);
+    if (verifyStatus == 401 || verifyStatus == 403) {
+      log.info(
+          "Repository '{}' settings.xml credentials returned 401, AND a fresh Entra"
+              + " token also returned {} against this feed. The Entra identity in"
+              + " scope (Azure CLI / env vars / Managed Identity) may not have access"
+              + " to this feed. Try `az login` as a user with feed access, or check"
+              + " role assignments.",
+          repo.getId(),
+          verifyStatus);
+      return true; // keep stale entry — overriding wouldn't help
+    }
+    return false; // verified — safe to drop and override with Entra token
+  }
+
+  /**
+   * Cache-aware Entra token fetch. Returns the cached {@code sharedCachedToken} if it's still
+   * within the refresh window, otherwise calls {@link #getAccessToken} to mint a fresh one (and
+   * populate the cache).
+   *
+   * <p>Centralized so every Entra-acquiring code path in this extension (boot fetch in {@link
+   * #afterProjectsRead}, per-stale-repo verification in {@link #probeAndDecide}, future sites)
+   * shares the same cache-check + fork-suppression discipline. Without it, {@code N} stale ADO
+   * {@code <server>} entries in {@code auto} mode would re-fork {@code az} N times even though the
+   * first call has already populated the cache.
+   */
+  String getCachedOrFreshAccessToken(TokenCredential credential) {
+    AccessToken cached = sharedCachedToken.get();
+    if (cached != null && !TokenAcquisition.isNearExpiry(cached)) {
+      return cached.getToken();
+    }
+    return getAccessToken(credential, sharedCachedToken);
+  }
+
+  /**
+   * Build the Basic-auth credential string (just user:password, base64-encoded). Returns empty
+   * string when either part is null so the caller can decide whether to send any Authorization
+   * header at all.
+   */
+  static String basicAuth(String user, String password) {
+    if (user == null || password == null) {
+      return "";
+    }
+    return Base64.getEncoder()
+        .encodeToString((user + ":" + password).getBytes(StandardCharsets.UTF_8));
+  }
+
+  /**
+   * Decrypt a {@code <server>} entry's password using Maven's master-password mechanism ({@code
+   * ~/.m2/settings-security.xml}). Returns:
+   *
+   * <ul>
+   *   <li>{@link Server#getPassword()} unchanged when the decrypter is unavailable (most unit
+   *       tests) or when decryption returns no usable result. May be {@code null} when the
+   *       underlying {@code <server>} entry has no {@code <password>} element — callers must treat
+   *       this the same as the decryption-failure null below (skip probing, trust entry).
+   *   <li>The decrypted password when decryption succeeds.
+   *   <li>{@code null} in two scenarios — pass-through of a null source password (no {@code
+   *       <password>} element configured, no WARN logged), OR explicit failure when decryption
+   *       reports an ERROR/FATAL-severity problem in {@code SettingsDecryptionResult.getProblems()}
+   *       — e.g. missing or wrong master password, or malformed {@code {...}} ciphertext. The
+   *       ERROR/FATAL case logs a WARN at the failure site naming the decryption error so the user
+   *       has signal to fix it; the pass-through case is silent. Callers MUST treat null as "skip
+   *       probing, trust the entry" so the user's actual config problem (broken
+   *       settings-security.xml, or missing {@code <password>}) isn't silently masked by an {@code
+   *       auto}-mode Entra override.
+   * </ul>
+   */
+  String decryptPassword(Server server) {
+    if (settingsDecrypter == null) {
+      return server.getPassword();
+    }
+    SettingsDecryptionResult result =
+        settingsDecrypter.decrypt(new DefaultSettingsDecryptionRequest(server));
+    // Check for decryption errors FIRST. DefaultSettingsDecrypter records failures in
+    // getProblems() but still returns a non-null Server with the ORIGINAL encrypted literal
+    // in the password field — so the null-check below would never trip for these failures.
+    // Without this branch, a broken ~/.m2/settings-security.xml would: send the encrypted
+    // literal as Basic auth (→ 401) → mark stale → override with Entra token (auto mode) →
+    // mask the real config problem.
+    for (org.apache.maven.settings.building.SettingsProblem problem : result.getProblems()) {
+      org.apache.maven.settings.building.SettingsProblem.Severity severity = problem.getSeverity();
+      if (severity == org.apache.maven.settings.building.SettingsProblem.Severity.ERROR
+          || severity == org.apache.maven.settings.building.SettingsProblem.Severity.FATAL) {
+        log.warn(
+            "Failed to decrypt password for server '{}': {} (at {}). Trusting the entry"
+                + " as-is; the build will surface Maven's canonical decryption error at"
+                + " fetch time. Fix ~/.m2/settings-security.xml to resolve.",
+            server.getId(),
+            problem.getMessage(),
+            problem.getLocation());
+        return null;
+      }
+    }
+    Server decrypted = result.getServer();
+    if (decrypted == null || decrypted.getPassword() == null) {
+      return server.getPassword();
+    }
+    return decrypted.getPassword();
+  }
+
+  /**
+   * 2-arg overload preserved for call sites without a {@link MavenSession} (tests, future callers
+   * that don't have session in scope). Delegates to the session-aware overload with {@code null}
+   * session, which falls back to the {@code System.getProperty} channel for the timeout knob.
+   */
+  int probeStatus(String url, String authorizationHeaderValue) {
+    return probeStatus(url, authorizationHeaderValue, null);
+  }
+
+  /**
+   * Single HEAD request against {@code url} with a pre-built {@code Authorization} header value (or
+   * no auth if {@code authorizationHeaderValue} is null/empty). Returns the HTTP status code, or 0
+   * on any IOException (treated as "trust the entry" by the caller — a transient network blip
+   * shouldn't override the user's settings).
+   *
+   * <p>Uses {@link HttpURLConnection} directly (not Aether's transport) so the Authorization header
+   * is never logged at DEBUG level by the resolver. Redirects are disabled so the Authorization
+   * header is never forwarded to a different host.
+   *
+   * <p>{@code session} controls timeout resolution: when non-null, {@link
+   * #resolveProbeTimeoutMillis} walks the 4-channel precedence (user props → system props → POM
+   * properties → JVM system property). When null (the 2-arg overload's path), only the JVM
+   * system-property fallback is consulted.
+   */
+  int probeStatus(String url, String authorizationHeaderValue, MavenSession session) {
+    HttpURLConnection conn = null;
+    try {
+      int timeoutMillis = resolveProbeTimeoutMillis(session);
+      conn = (HttpURLConnection) new URL(url).openConnection();
+      conn.setRequestMethod("HEAD");
+      conn.setConnectTimeout(timeoutMillis);
+      conn.setReadTimeout(timeoutMillis);
+      conn.setInstanceFollowRedirects(false);
+      if (authorizationHeaderValue != null && !authorizationHeaderValue.isEmpty()) {
+        conn.setRequestProperty("Authorization", authorizationHeaderValue);
+      }
+      return conn.getResponseCode();
+    } catch (IOException e) {
+      // Don't log the full URL at WARN to avoid noise on every transient blip; DEBUG
+      // is enough since this is a recovery-helper feature, not load-bearing auth.
+      log.debug("Probe of {} failed with {}; trusting existing credentials.", url, e.toString());
+      return 0;
+    } finally {
+      if (conn != null) {
+        conn.disconnect();
+      }
+    }
+  }
+
+  /**
+   * Resolve the connect/read timeout for {@link #probeStatus} from {@link #PROBE_TIMEOUT_PROPERTY}.
+   * Mirrors {@link #resolveValidationMode}'s 4-channel precedence so the user has a uniform
+   * configuration surface across both knobs introduced by v0.0.8:
+   *
+   * <ol>
+   *   <li>{@code session.getUserProperties()} — {@code -D} on the command line, {@code
+   *       .mvn/maven.config}.
+   *   <li>{@code session.getSystemProperties()} — {@code MAVEN_OPTS}, JVM args.
+   *   <li>POM {@code <properties>} on the root project — natural for per-project tuning (e.g. a
+   *       slow-CI repo committing the timeout once instead of every CI invocation passing {@code
+   *       -D}).
+   *   <li>{@link System#getProperty} as a final fallback — used by tests that don't construct a
+   *       MavenSession, and as defense-in-depth if a caller ever invokes the 2-arg probeStatus
+   *       without a session (mirroring how Maven's own utilities tolerate session-less calls).
+   * </ol>
+   *
+   * <p>Falls back to {@link #DEFAULT_PROBE_TIMEOUT_MILLIS} on missing, unparseable, or non-positive
+   * values. Invalid values log at DEBUG (not WARN) since this is a tuning knob; the wrong value
+   * just degrades to the default and the build proceeds.
+   */
+  int resolveProbeTimeoutMillis(MavenSession session) {
+    String raw = readSessionPropertyOrSystem(session, PROBE_TIMEOUT_PROPERTY);
+    if (raw == null) {
+      return DEFAULT_PROBE_TIMEOUT_MILLIS;
+    }
+    try {
+      int parsed = Integer.parseInt(raw.trim());
+      if (parsed <= 0) {
+        log.debug(
+            "Ignoring non-positive {}={}; using default {}",
+            PROBE_TIMEOUT_PROPERTY,
+            raw,
+            DEFAULT_PROBE_TIMEOUT_MILLIS);
+        return DEFAULT_PROBE_TIMEOUT_MILLIS;
+      }
+      return parsed;
+    } catch (NumberFormatException e) {
+      log.debug(
+          "Ignoring unparseable {}={}; using default {}",
+          PROBE_TIMEOUT_PROPERTY,
+          raw,
+          DEFAULT_PROBE_TIMEOUT_MILLIS);
+      return DEFAULT_PROBE_TIMEOUT_MILLIS;
+    }
+  }
+
+  /**
+   * Walk the same 4-channel precedence as {@link #resolveValidationMode} to read a single property
+   * by name. Returns null when no channel has the property set. Centralizes the null-tolerant
+   * traversal so {@link #resolveProbeTimeoutMillis} (and any future per-build knob) gets the same
+   * lookup discipline without duplicating boilerplate.
+   */
+  private static String readSessionPropertyOrSystem(MavenSession session, String key) {
+    if (session != null) {
+      java.util.Properties userProps = session.getUserProperties();
+      if (userProps != null) {
+        String v = userProps.getProperty(key);
+        if (v != null) {
+          return v;
+        }
+      }
+      java.util.Properties sysProps = session.getSystemProperties();
+      if (sysProps != null) {
+        String v = sysProps.getProperty(key);
+        if (v != null) {
+          return v;
+        }
+      }
+      List<MavenProject> projects = session.getProjects();
+      if (projects != null && !projects.isEmpty()) {
+        String v = projects.get(0).getProperties().getProperty(key);
+        if (v != null) {
+          return v;
+        }
+      }
+    }
+    return System.getProperty(key);
   }
 
   private boolean isMirroredWithCredentials(String repoId, Settings settings) {

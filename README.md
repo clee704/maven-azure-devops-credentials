@@ -20,7 +20,7 @@ Add the following to `.mvn/extensions.xml` in your project root:
   <extension>
     <groupId>dev.chungmin</groupId>
     <artifactId>maven-azure-devops-credentials</artifactId>
-    <version>0.0.7</version><!-- release-version -->
+    <version>0.0.8</version><!-- release-version -->
   </extension>
 </extensions>
 ```
@@ -55,13 +55,69 @@ The extension detects Azure DevOps feed URLs (`*.pkgs.visualstudio.com` and `pkg
 
 ## Credential precedence
 
-The extension **respects existing credentials**. If a `<server>` entry in `settings.xml` already matches a repository ID, the extension skips that repository entirely — no Azure Identity invocation occurs.
+The extension **respects existing credentials**, but as of v0.0.8 it validates
+them with a HEAD probe against the feed before trusting them. Valid entries
+(probe returns anything other than `401`) take the fast path exactly as before
+— no extra round-trips on the happy path. A `401` response indicates the
+entry is stale (rotated PAT, expired credential), and the extension can
+override it with a fresh Entra token instead of letting the build fail.
 
-This means the extension is safe to use alongside:
+The probe is controlled by `dev.chungmin.azure.validateExistingCredentials`
+(values: `auto` (default), `always`, `never`):
 
-- **Azure Pipelines `MavenAuthenticate` task** — which populates `settings.xml` at build time. The extension will detect the existing credentials and do nothing.
-- **Manual PATs in `settings.xml`** — they continue to work as before.
-- **Mixed setups** — some repos can use `settings.xml` credentials while others are handled by the extension.
+| Mode | Stale entry (401) + Entra reachable + new token works for feed | Stale + Entra reachable but new token has no feed access | Stale + Entra unreachable | Use case |
+|---|---|---|---|---|
+| `auto` (default) | Override entry in-place with fresh Entra token | Keep entry (Bearer-verify catches the no-access case); log INFO about Entra-identity access | Keep entry; log INFO with `az login` remediation | Recover from stale PATs automatically; safe defaults that never silently replace a working credential with a non-working one |
+| `always` | Override entry in-place | Override entry with the new (no-access) token; build still 401s but with the new token, not the original PAT | Keep entry (no token to override with); `WARN` from the failed Entra attempt surfaces | Force the Entra path eagerly — skips the auto-mode Bearer-verify safety check; useful when you want to be told about Entra-side failures via the Entra `WARN` instead of an opaque feed 401 |
+| `never` | Trust entry | Trust entry | Trust entry | v0.0.7 behavior — disables the probe entirely |
+
+All three modes trust the entry unconditionally when the probe returns anything other than `401` (200, 404, network error, etc.). The modes only differ in how aggressively they react to a `401` response.
+
+Configure via any of:
+
+```bash
+# CLI (one-off)
+mvn -Ddev.chungmin.azure.validateExistingCredentials=always …
+
+# .mvn/maven.config (per-project, checked in)
+echo "-Ddev.chungmin.azure.validateExistingCredentials=always" >> .mvn/maven.config
+
+# POM <properties> (per-project, Maven-native)
+<properties>
+  <dev.chungmin.azure.validateExistingCredentials>always</dev.chungmin.azure.validateExistingCredentials>
+</properties>
+
+# MAVEN_OPTS (per-user or CI)
+export MAVEN_OPTS="$MAVEN_OPTS -Ddev.chungmin.azure.validateExistingCredentials=always"
+```
+
+The extension remains safe to use alongside:
+
+- **Azure Pipelines `MavenAuthenticate` task** — which populates `settings.xml`
+  at build time. The probe verifies those credentials work; if they do (they
+  should), the extension is a no-op for those feeds.
+- **Manual PATs in `settings.xml`** — they continue to work as before. The
+  probe only intervenes when the PAT has actually gone stale.
+- **Mixed setups** — some repos in `settings.xml`, others handled by the
+  extension. Probe applies independently per repo.
+- **Encrypted passwords** (Maven master-password mechanism with
+  `settings-security.xml`) — the probe decrypts before sending, so encrypted
+  entries don't get falsely classified as stale.
+
+**Probe behavior caveats** (also see Limitations):
+
+- Probe applies only to Azure DevOps feed URLs; non-ADO entries are never
+  probed (we have no Entra fallback for them).
+- Probe results are cached per `<repoId>` for the duration of one Maven
+  invocation; a multi-module build touching the same feed N times probes once.
+- Probes don't follow redirects, so `Authorization` headers can't leak
+  cross-host.
+- Probe failures other than `401` (network errors, 5xx, 404) all trust the
+  entry — broken-feed detection is out of scope.
+- Probe connect/read timeout defaults to 5 seconds; on slow networks the
+  probe can time out and the entry will be trusted (effectively `never` mode
+  for that build). Override with `-Ddev.chungmin.azure.probeTimeoutMillis=<ms>`
+  (see Troubleshooting).
 
 ## Compatibility
 
@@ -91,6 +147,40 @@ mvn -X ...
 ```
 
 Look for log messages from `dev.chungmin.maven.AzureDevOpsCredentialsExtension`.
+
+### Tuning the probe timeout
+
+The stale-credential HEAD probe uses a 5-second connect/read timeout by
+default. On slow networks (cross-region ADO traffic from a high-latency CI
+agent, restricted egress proxies, etc.) a healthy probe can time out, which
+trips the "treat IO error as trust the entry" fallback in `probeStatus`. The
+stale-credential feature then effectively no-ops for that build even though
+the user opted in via `auto`/`always` mode.
+
+Raise the timeout with `dev.chungmin.azure.probeTimeoutMillis`. It honors the
+same 4-channel precedence as `dev.chungmin.azure.validateExistingCredentials`:
+user properties (`-D` and `.mvn/maven.config`) win over system properties
+(`MAVEN_OPTS`), which win over POM root-project `<properties>`, which fall
+back to JVM system properties:
+
+```bash
+# CI invocation: -D on the command line
+mvn -Ddev.chungmin.azure.probeTimeoutMillis=30000 ...
+
+# Project-level pin via .mvn/maven.config (committed once, applies to every
+# CI invocation against this repo)
+echo "-Ddev.chungmin.azure.probeTimeoutMillis=30000" >> .mvn/maven.config
+
+# Or as a POM property if the slow-CI repo wants to commit the override there
+# rather than in .mvn/maven.config:
+# <properties>
+#   <dev.chungmin.azure.probeTimeoutMillis>30000</dev.chungmin.azure.probeTimeoutMillis>
+# </properties>
+```
+
+Invalid, non-numeric, or non-positive values fall back to the 5000 ms
+default and log a DEBUG line. Applies to both the Basic-auth probe of the
+existing entry and the Bearer-auth verify of a freshly-acquired Entra token.
 
 ### Tuning the proactive-refresh threshold
 

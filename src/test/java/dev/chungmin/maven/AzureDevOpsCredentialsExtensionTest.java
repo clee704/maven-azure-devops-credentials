@@ -33,6 +33,8 @@ import org.apache.maven.project.MavenProject;
 import org.apache.maven.repository.RepositorySystem;
 import org.apache.maven.settings.Server;
 import org.apache.maven.settings.Settings;
+import org.apache.maven.settings.crypto.SettingsDecrypter;
+import org.apache.maven.settings.crypto.SettingsDecryptionResult;
 import org.eclipse.aether.DefaultRepositorySystemSession;
 import org.eclipse.aether.repository.Authentication;
 import org.eclipse.aether.repository.AuthenticationSelector;
@@ -65,8 +67,15 @@ public class AzureDevOpsCredentialsExtensionTest {
     when(session.getSettings()).thenReturn(settings);
     when(session.getProjects()).thenReturn(Arrays.asList(project));
     when(session.getRepositorySession()).thenReturn(repoSession);
+    // Default to validation mode = "never" for existing tests, preserving the
+    // pre-0.0.8 "trust settings.xml entries blindly" semantics they were
+    // written against. Probe-specific tests override userProperties.
+    java.util.Properties userProps = new java.util.Properties();
+    userProps.setProperty(AzureDevOpsCredentialsExtension.VALIDATE_PROPERTY, "never");
+    when(session.getUserProperties()).thenReturn(userProps);
     when(project.getRepositories()).thenReturn(Collections.emptyList());
     when(project.getPluginRepositories()).thenReturn(Collections.emptyList());
+    when(project.getProperties()).thenReturn(new java.util.Properties());
     extension = extensionWith(mockCredential);
   }
 
@@ -808,5 +817,1034 @@ public class AzureDevOpsCredentialsExtensionTest {
     return new RemoteRepository.Builder(
             id, "default", "https://pkgs.dev.azure.com/org/proj/_packaging/" + id + "/maven/v1")
         .build();
+  }
+
+  // ===== Stale-credential probe coverage (v0.0.8+) =====
+
+  /** Build a Properties object with the validation-mode property set. */
+  private static java.util.Properties userPropsWithMode(String mode) {
+    java.util.Properties p = new java.util.Properties();
+    p.setProperty(AzureDevOpsCredentialsExtension.VALIDATE_PROPERTY, mode);
+    return p;
+  }
+
+  /**
+   * Stub session.getUserProperties() to return a fresh property bag. Useful when a test needs to
+   * override the @Before default (which pins mode = "never").
+   */
+  private void useValidationMode(String mode) {
+    when(session.getUserProperties()).thenReturn(userPropsWithMode(mode));
+  }
+
+  /**
+   * A toy HTTP/1.1 server that serves a single response and exits. Used by probeStatus tests to
+   * assert real HEAD-request behavior without external network.
+   */
+  private static int startStaticServer(String response) throws java.io.IOException {
+    java.net.ServerSocket server = new java.net.ServerSocket(0);
+    int port = server.getLocalPort();
+    Thread t =
+        new Thread(
+            () -> {
+              try {
+                java.net.Socket client = server.accept();
+                try {
+                  byte[] buf = new byte[2048];
+                  client.getInputStream().read(buf);
+                  client
+                      .getOutputStream()
+                      .write(response.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                  client.getOutputStream().flush();
+                } finally {
+                  client.close();
+                }
+              } catch (java.io.IOException ignored) {
+                // Test server best-effort; failures surface as the probe returning 0.
+              } finally {
+                try {
+                  server.close();
+                } catch (java.io.IOException ignored) {
+                  // already closed
+                }
+              }
+            });
+    t.setDaemon(true);
+    t.start();
+    return port;
+  }
+
+  // --- normalizeMode (via resolveValidationMode) ---
+
+  @Test
+  public void resolveValidationMode_defaultsToAutoWhenUnset() {
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    when(project.getProperties()).thenReturn(new java.util.Properties());
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_AUTO, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_userPropertyAlwaysWins() {
+    useValidationMode("always");
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_ALWAYS, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_userPropertyNever() {
+    useValidationMode("never");
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_NEVER, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_isCaseInsensitive() {
+    useValidationMode("ALWAYS");
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_ALWAYS, extension.resolveValidationMode(session));
+    useValidationMode("Never");
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_NEVER, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_unknownValueFallsBackToAuto() {
+    useValidationMode("garbage");
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_AUTO, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_whitespacePaddedNeverParsesAsNever() {
+    // Regression: pre-fix, `-Ddev.chungmin.azure.validateExistingCredentials=" never "`
+    // (whitespace from a shell-quoting accident or .mvn/maven.config newline) fell back to
+    // VALIDATE_AUTO because normalizeMode didn't trim before the equality check — the user
+    // silently got the opposite of what they asked for (probe enabled instead of disabled).
+    useValidationMode("  never  ");
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_NEVER, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_tabWrappedAlwaysParsesAsAlways() {
+    useValidationMode("\talways\t");
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_ALWAYS, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_whitespaceOnlyFallsBackToAuto() {
+    // After trim() the value is empty, which is unknown — falls back to AUTO.
+    useValidationMode("   ");
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_AUTO, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_pomPropertyConsultedWhenUserPropertyUnset() {
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    java.util.Properties pomProps = new java.util.Properties();
+    pomProps.setProperty(AzureDevOpsCredentialsExtension.VALIDATE_PROPERTY, "always");
+    when(project.getProperties()).thenReturn(pomProps);
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_ALWAYS, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_userPropertyOverridesPom() {
+    useValidationMode("never");
+    java.util.Properties pomProps = new java.util.Properties();
+    pomProps.setProperty(AzureDevOpsCredentialsExtension.VALIDATE_PROPERTY, "always");
+    when(project.getProperties()).thenReturn(pomProps);
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_NEVER, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_handlesEmptyProjects() {
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    when(session.getProjects()).thenReturn(Collections.emptyList());
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_AUTO, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_handlesNullProjects() {
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    when(session.getProjects()).thenReturn(null);
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_AUTO, extension.resolveValidationMode(session));
+  }
+
+  // R2 fix: MAVEN_OPTS-set -D flags land in session.getSystemProperties(), NOT
+  // session.getUserProperties() (per MavenCli.populateProperties). Without the
+  // systemProperties fallback in resolveValidationMode, the documented MAVEN_OPTS
+  // configuration path silently does nothing.
+
+  @Test
+  public void resolveValidationMode_systemPropertyConsultedWhenUserPropertyUnset() {
+    // No user-property set; MAVEN_OPTS-equivalent value in systemProperties.
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    java.util.Properties sysProps = new java.util.Properties();
+    sysProps.setProperty(AzureDevOpsCredentialsExtension.VALIDATE_PROPERTY, "always");
+    when(session.getSystemProperties()).thenReturn(sysProps);
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_ALWAYS, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_userPropertyOverridesSystemProperty() {
+    // User -D wins over MAVEN_OPTS — matches Maven's own resolution discipline.
+    useValidationMode("never");
+    java.util.Properties sysProps = new java.util.Properties();
+    sysProps.setProperty(AzureDevOpsCredentialsExtension.VALIDATE_PROPERTY, "always");
+    when(session.getSystemProperties()).thenReturn(sysProps);
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_NEVER, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_systemPropertyOverridesPomProperty() {
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    java.util.Properties sysProps = new java.util.Properties();
+    sysProps.setProperty(AzureDevOpsCredentialsExtension.VALIDATE_PROPERTY, "always");
+    when(session.getSystemProperties()).thenReturn(sysProps);
+    java.util.Properties pomProps = new java.util.Properties();
+    pomProps.setProperty(AzureDevOpsCredentialsExtension.VALIDATE_PROPERTY, "never");
+    when(project.getProperties()).thenReturn(pomProps);
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_ALWAYS, extension.resolveValidationMode(session));
+  }
+
+  @Test
+  public void resolveValidationMode_handlesNullSystemProperties() {
+    // Defensive: a mock session that returns null systemProperties (Mockito default)
+    // must not NPE.
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    when(session.getSystemProperties()).thenReturn(null);
+    assertEquals(
+        AzureDevOpsCredentialsExtension.VALIDATE_AUTO, extension.resolveValidationMode(session));
+  }
+
+  // --- probeStatus (real network via local socket) ---
+
+  @Test
+  public void probeStatus_200_returns200() throws Exception {
+    int port = startStaticServer("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    assertEquals(200, extension.probeStatus("http://localhost:" + port + "/", "Basic dTpw"));
+  }
+
+  @Test
+  public void probeStatus_401_returns401() throws Exception {
+    int port = startStaticServer("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+    assertEquals(401, extension.probeStatus("http://localhost:" + port + "/", "Basic dTpw"));
+  }
+
+  @Test
+  public void probeStatus_networkError_returns0() {
+    // Port 1 has nothing listening on it — connect fails immediately.
+    assertEquals(0, extension.probeStatus("http://localhost:1/", "Basic dTpw"));
+  }
+
+  @Test
+  public void probeStatus_omitsAuthHeaderWhenNull() throws Exception {
+    int port = startStaticServer("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    assertEquals(200, extension.probeStatus("http://localhost:" + port + "/", null));
+  }
+
+  @Test
+  public void probeStatus_omitsAuthHeaderWhenEmpty() throws Exception {
+    int port = startStaticServer("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    assertEquals(200, extension.probeStatus("http://localhost:" + port + "/", ""));
+  }
+
+  @Test
+  public void probeStatus_acceptsBearerToken() throws Exception {
+    int port = startStaticServer("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    assertEquals(
+        200, extension.probeStatus("http://localhost:" + port + "/", "Bearer eyJ.fake.token"));
+  }
+
+  @Test
+  public void basicAuth_nullUser_returnsEmpty() {
+    assertEquals("", AzureDevOpsCredentialsExtension.basicAuth(null, "p"));
+  }
+
+  @Test
+  public void basicAuth_nullPassword_returnsEmpty() {
+    assertEquals("", AzureDevOpsCredentialsExtension.basicAuth("u", null));
+  }
+
+  @Test
+  public void basicAuth_validInputs_returnsBase64() {
+    // RFC 7617 §2 example: Aladdin:OpenSesame -> QWxhZGRpbjpPcGVuU2VzYW1l
+    assertEquals(
+        "QWxhZGRpbjpPcGVuU2VzYW1l",
+        AzureDevOpsCredentialsExtension.basicAuth("Aladdin", "OpenSesame"));
+  }
+
+  // ===== R1-fix regression guards =====
+
+  /**
+   * Mirror-stale interaction: an ADO repo's {@code <server>} entry is stale, but the repo is
+   * covered by a mirror with credentials. R1 bug: stale tracking ran BEFORE the mirror check, so
+   * the entry was probed (wasted) AND tracked in {@code staleEntries} — which produced a misleading
+   * "Build will likely fail with 401" diagnostic in the no-token failure path even though Aether
+   * would resolve through the mirror. Fix: mirror check runs first.
+   */
+  @Test
+  public void afterProjectsRead_staleEntry_coveredByMirrorWithCredentials_skipsProbeAndTracking()
+      throws Exception {
+    useValidationMode("auto");
+    // The mirror entry has working creds → Aether will use the mirror, not the repo's <server>.
+    org.apache.maven.settings.Mirror mirror = new org.apache.maven.settings.Mirror();
+    mirror.setId("MyMirror");
+    mirror.setMirrorOf("*");
+    mirror.setUrl("https://pkgs.dev.azure.com/o/p/_packaging/MyMirror/maven/v1");
+    settings.addMirror(mirror);
+    settings.addServer(server("MyMirror", "mirroruser", "mirrorpat"));
+    // The repo itself ALSO has a stale settings entry. In v0.0.8 R1, this got probed
+    // and tracked; in R1-fix this short-circuits at the mirror check.
+    settings.addServer(server("MyFeed", "user", "stale-pat"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+
+    final java.util.concurrent.atomic.AtomicInteger probeCount =
+        new java.util.concurrent.atomic.AtomicInteger();
+    AzureDevOpsCredentialsExtension ext =
+        new AzureDevOpsCredentialsExtension() {
+          @Override
+          TokenCredential createCredential() {
+            return mockCredential;
+          }
+
+          @Override
+          int probeStatus(String url, String authorization, MavenSession s) {
+            probeCount.incrementAndGet();
+            return 401;
+          }
+        };
+    Field f = AzureDevOpsCredentialsExtension.class.getDeclaredField("repositorySystem");
+    f.setAccessible(true);
+    f.set(ext, repositorySystem);
+
+    ext.afterProjectsRead(session);
+
+    assertEquals("Mirror-covered repo must NOT be probed", 0, probeCount.get());
+    assertEquals(
+        "Mirror-covered repo's stale entry must NOT be mutated",
+        "stale-pat",
+        settings.getServer("MyFeed").getPassword());
+    verify(mockCredential, never()).getToken(any());
+  }
+
+  /**
+   * Cache-aware Entra acquisition: probeAndDecide must not re-fork {@code az} per stale repo. R1
+   * bug: each stale repo in auto-mode called {@code getAccessToken} directly, bypassing the shared
+   * cache. With N stale repos pointed at the same auth scope, that's N forks where one suffices.
+   * Fix: extracted {@code getCachedOrFreshAccessToken} helper used in both {@code probeAndDecide}
+   * and {@code afterProjectsRead}.
+   */
+  /**
+   * R3 finding: in `auto` mode with N stale entries AND Entra unreachable, the cache-aware helper
+   * only short-circuits on the success path — failure leaves the cache empty, so the next stale
+   * repo re-forks `az`. Fix: also gate on {@code sharedFailureState} (already set by {@code
+   * useFallbackOrWarnUnauthenticated} on failure, reset on success).
+   */
+  @Test
+  public void afterProjectsRead_multipleStaleEntries_autoMode_entraUnreachable_singleFork()
+      throws Exception {
+    useValidationMode("auto");
+    settings.addServer(server("FeedA", "user", "stale-A"));
+    settings.addServer(server("FeedB", "user", "stale-B"));
+    settings.addServer(server("FeedC", "user", "stale-C"));
+    when(project.getRepositories())
+        .thenReturn(Arrays.asList(adoRepo("FeedA"), adoRepo("FeedB"), adoRepo("FeedC")));
+    // Every getToken call fails — simulates `az login` expired.
+    when(mockCredential.getToken(any())).thenReturn(Mono.empty());
+    AzureDevOpsCredentialsExtension ext = extensionWithProbeStub(mockCredential, 401, 401);
+
+    ext.afterProjectsRead(session);
+
+    // All three stale entries kept untouched.
+    assertEquals("stale-A", settings.getServer("FeedA").getPassword());
+    assertEquals("stale-B", settings.getServer("FeedB").getPassword());
+    assertEquals("stale-C", settings.getServer("FeedC").getPassword());
+    // Without the sharedFailureState short-circuit, this would be 4: one per stale repo
+    // (3 probeAndDecide calls) + one boot fetch in afterProjectsRead. With the gate, only
+    // the FIRST attempt fires; subsequent stale repos see sharedFailureState == true and
+    // skip retry. The boot fetch ALSO sees sharedFailureState but already goes through
+    // getCachedOrFreshAccessToken (which calls getAccessToken when cache is null). So we
+    // expect 2 calls: 1 from the first probeAndDecide (sets sharedFailureState),
+    // 1 from the boot fetch (cache still null because the failure didn't populate it).
+    // The point of the fix is bounding the number to a CONSTANT (independent of N stale
+    // entries), not necessarily 1.
+    verify(mockCredential, atMost(2)).getToken(any());
+  }
+
+  @Test
+  public void afterProjectsRead_multipleStaleEntries_autoMode_acquiresEntraOnce() throws Exception {
+    useValidationMode("auto");
+    settings.addServer(server("FeedA", "user", "stale-A"));
+    settings.addServer(server("FeedB", "user", "stale-B"));
+    settings.addServer(server("FeedC", "user", "stale-C"));
+    when(project.getRepositories())
+        .thenReturn(Arrays.asList(adoRepo("FeedA"), adoRepo("FeedB"), adoRepo("FeedC")));
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("shared", OffsetDateTime.now().plusHours(1))));
+    AzureDevOpsCredentialsExtension ext = extensionWithProbeStub(mockCredential, 401, 200);
+
+    ext.afterProjectsRead(session);
+
+    // Three stale repos all overridden — but token acquired ONCE (cache shared across them
+    // AND with the boot fetch at the end of afterProjectsRead).
+    assertEquals("shared", settings.getServer("FeedA").getPassword());
+    assertEquals("shared", settings.getServer("FeedB").getPassword());
+    assertEquals("shared", settings.getServer("FeedC").getPassword());
+    verify(mockCredential, times(1)).getToken(any());
+  }
+
+  /**
+   * Decryption-failure handling: when {@code SettingsDecryptionResult.getProblems()} contains
+   * ERROR/FATAL entries, {@code decryptPassword} returns null and {@code probeAndDecide} treats the
+   * entry as trusted (NOT stale) so the user's broken settings-security.xml isn't silently masked
+   * by an Entra override.
+   */
+  @Test
+  public void decryptPassword_decryptionErrorSeverity_returnsNull() throws Exception {
+    SettingsDecrypter decrypter = mock(SettingsDecrypter.class);
+    SettingsDecryptionResult result = mock(SettingsDecryptionResult.class);
+    Server decrypted = server("X", "u", "{encrypted-still}");
+    org.apache.maven.settings.building.SettingsProblem problem =
+        mock(org.apache.maven.settings.building.SettingsProblem.class);
+    when(problem.getSeverity())
+        .thenReturn(org.apache.maven.settings.building.SettingsProblem.Severity.ERROR);
+    when(problem.getMessage()).thenReturn("Master password decryption failed");
+    when(problem.getLocation()).thenReturn("settings-security.xml");
+    when(result.getProblems()).thenReturn(java.util.Collections.singletonList(problem));
+    when(result.getServer()).thenReturn(decrypted);
+    when(decrypter.decrypt(any())).thenReturn(result);
+
+    Field f = AzureDevOpsCredentialsExtension.class.getDeclaredField("settingsDecrypter");
+    f.setAccessible(true);
+    f.set(extension, decrypter);
+
+    assertNull(
+        "Decryption error must return null so caller skips probing/staleness classification",
+        extension.decryptPassword(server("X", "u", "{ENC...}")));
+  }
+
+  @Test
+  public void decryptPassword_decryptionFatalSeverity_returnsNull() throws Exception {
+    SettingsDecrypter decrypter = mock(SettingsDecrypter.class);
+    SettingsDecryptionResult result = mock(SettingsDecryptionResult.class);
+    org.apache.maven.settings.building.SettingsProblem problem =
+        mock(org.apache.maven.settings.building.SettingsProblem.class);
+    when(problem.getSeverity())
+        .thenReturn(org.apache.maven.settings.building.SettingsProblem.Severity.FATAL);
+    when(problem.getMessage()).thenReturn("Catastrophic decrypter init failure");
+    when(problem.getLocation()).thenReturn("settings-security.xml");
+    when(result.getProblems()).thenReturn(java.util.Collections.singletonList(problem));
+    when(decrypter.decrypt(any())).thenReturn(result);
+
+    Field f = AzureDevOpsCredentialsExtension.class.getDeclaredField("settingsDecrypter");
+    f.setAccessible(true);
+    f.set(extension, decrypter);
+
+    assertNull(extension.decryptPassword(server("X", "u", "{ENC...}")));
+  }
+
+  @Test
+  public void decryptPassword_warningProblemsOnly_returnsDecryptedValue() throws Exception {
+    // WARNING-severity problems must NOT trigger the null-return path (no user-visible bug,
+    // just informational). The decrypted value still flows through.
+    SettingsDecrypter decrypter = mock(SettingsDecrypter.class);
+    SettingsDecryptionResult result = mock(SettingsDecryptionResult.class);
+    org.apache.maven.settings.building.SettingsProblem warning =
+        mock(org.apache.maven.settings.building.SettingsProblem.class);
+    when(warning.getSeverity())
+        .thenReturn(org.apache.maven.settings.building.SettingsProblem.Severity.WARNING);
+    Server decrypted = server("X", "u", "real-secret");
+    when(result.getProblems()).thenReturn(java.util.Collections.singletonList(warning));
+    when(result.getServer()).thenReturn(decrypted);
+    when(decrypter.decrypt(any())).thenReturn(result);
+
+    Field f = AzureDevOpsCredentialsExtension.class.getDeclaredField("settingsDecrypter");
+    f.setAccessible(true);
+    f.set(extension, decrypter);
+
+    assertEquals("real-secret", extension.decryptPassword(server("X", "u", "{ENC...}")));
+  }
+
+  @Test
+  public void afterProjectsRead_staleEntry_decryptionFails_keepsEntryUntouched() throws Exception {
+    // End-to-end: decryption error → probe is skipped → entry is NOT classified as stale →
+    // Entra never overrides → user's broken settings-security.xml surfaces normally at fetch.
+    useValidationMode("auto");
+    settings.addServer(server("MyFeed", "user", "{ENC-broken}"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+
+    // Wire up a SettingsDecrypter that always reports ERROR-severity problems.
+    SettingsDecrypter decrypter = mock(SettingsDecrypter.class);
+    SettingsDecryptionResult result = mock(SettingsDecryptionResult.class);
+    org.apache.maven.settings.building.SettingsProblem problem =
+        mock(org.apache.maven.settings.building.SettingsProblem.class);
+    when(problem.getSeverity())
+        .thenReturn(org.apache.maven.settings.building.SettingsProblem.Severity.ERROR);
+    when(problem.getMessage()).thenReturn("Broken master-password file");
+    when(problem.getLocation()).thenReturn("settings-security.xml");
+    when(result.getProblems()).thenReturn(java.util.Collections.singletonList(problem));
+    when(decrypter.decrypt(any())).thenReturn(result);
+
+    AzureDevOpsCredentialsExtension ext =
+        new AzureDevOpsCredentialsExtension() {
+          @Override
+          TokenCredential createCredential() {
+            return mockCredential;
+          }
+
+          @Override
+          int probeStatus(String url, String authorization, MavenSession s) {
+            fail("probeStatus must NOT be called when decryption fails");
+            return -1;
+          }
+        };
+    Field rs = AzureDevOpsCredentialsExtension.class.getDeclaredField("repositorySystem");
+    rs.setAccessible(true);
+    rs.set(ext, repositorySystem);
+    Field sd = AzureDevOpsCredentialsExtension.class.getDeclaredField("settingsDecrypter");
+    sd.setAccessible(true);
+    sd.set(ext, decrypter);
+
+    ext.afterProjectsRead(session);
+
+    // Encrypted literal preserved — no Entra override. Build will surface the real decryption
+    // error at the actual fetch site (Maven's own decryption attempt).
+    assertEquals("{ENC-broken}", settings.getServer("MyFeed").getPassword());
+    verify(mockCredential, never()).getToken(any());
+  }
+
+  // --- probeAndDecide via existingServerUsable (the production decision tree) ---
+
+  /**
+   * Test seam that lets each test inject the Basic-probe return AND optionally the Bearer-verify
+   * return (for auto-mode-Entra-works-but-no-feed-access tests).
+   */
+  private AzureDevOpsCredentialsExtension extensionWithProbeStub(
+      TokenCredential credential, int probeReturn) throws ReflectiveOperationException {
+    return extensionWithProbeStub(credential, probeReturn, probeReturn);
+  }
+
+  private AzureDevOpsCredentialsExtension extensionWithProbeStub(
+      TokenCredential credential, int basicProbeReturn, int bearerProbeReturn)
+      throws ReflectiveOperationException {
+    AzureDevOpsCredentialsExtension ext =
+        new AzureDevOpsCredentialsExtension() {
+          @Override
+          TokenCredential createCredential() {
+            return credential;
+          }
+
+          @Override
+          int probeStatus(String url, String authorization, MavenSession s) {
+            if (authorization != null && authorization.startsWith("Bearer ")) {
+              return bearerProbeReturn;
+            }
+            return basicProbeReturn;
+          }
+        };
+    Field field = AzureDevOpsCredentialsExtension.class.getDeclaredField("repositorySystem");
+    field.setAccessible(true);
+    field.set(ext, repositorySystem);
+    return ext;
+  }
+
+  @Test
+  public void afterProjectsRead_staleEntry_alwaysMode_mutatesPasswordInPlace() throws Exception {
+    useValidationMode("always");
+    settings.addServer(server("MyFeed", "user", "stale-pat"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("fresh-token", OffsetDateTime.now().plusHours(1))));
+    AzureDevOpsCredentialsExtension ext = extensionWithProbeStub(mockCredential, 401);
+
+    ext.afterProjectsRead(session);
+
+    Server actual = settings.getServer("MyFeed");
+    assertEquals(
+        "Stale entry's password must be overridden with the fresh Entra token",
+        "fresh-token",
+        actual.getPassword());
+    // The username on a stale entry is preserved (we only mutate password).
+    assertEquals("user", actual.getUsername());
+    // Live-headers were installed for the stale repoId too.
+    assertNotNull(
+        repoSession
+            .getConfigProperties()
+            .get(org.eclipse.aether.ConfigurationProperties.HTTP_HEADERS + ".MyFeed"));
+  }
+
+  @Test
+  public void afterProjectsRead_staleEntry_autoMode_entraReachable_mutates() throws Exception {
+    useValidationMode("auto");
+    settings.addServer(server("MyFeed", "user", "stale-pat"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.just(new AccessToken("auto-fresh", OffsetDateTime.now().plusHours(1))));
+    // basicProbe=401 (stale), bearerProbe=200 (fresh token verified to work).
+    AzureDevOpsCredentialsExtension ext = extensionWithProbeStub(mockCredential, 401, 200);
+
+    ext.afterProjectsRead(session);
+
+    assertEquals("auto-fresh", settings.getServer("MyFeed").getPassword());
+  }
+
+  @Test
+  public void afterProjectsRead_staleEntry_autoMode_entraReachableButNoFeedAccess_keepsStaleEntry()
+      throws Exception {
+    // The bug-1 scenario from sbt-IT round 1: on an Azure VM with MI, getToken()
+    // returns a token via Managed Identity even when AzureCli is unavailable.
+    // The MI may not have access to the feed the user's PAT was scoped to.
+    // After acquiring the new token, verify it ALSO works before overriding;
+    // if Bearer-probe returns 401, the new token wouldn't help — keep stale
+    // entry and log a clearer diagnostic about Entra identity access.
+    useValidationMode("auto");
+    settings.addServer(server("MyFeed", "user", "stale-pat"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(mockCredential.getToken(any()))
+        .thenReturn(
+            Mono.just(new AccessToken("mi-no-feed-access", OffsetDateTime.now().plusHours(1))));
+    AzureDevOpsCredentialsExtension ext = extensionWithProbeStub(mockCredential, 401, 401);
+
+    ext.afterProjectsRead(session);
+
+    // Stale entry retained — the new token wouldn't have worked either.
+    assertEquals("stale-pat", settings.getServer("MyFeed").getPassword());
+  }
+
+  @Test
+  public void afterProjectsRead_staleEntry_autoMode_entraUnreachable_keepsStaleEntry()
+      throws Exception {
+    useValidationMode("auto");
+    settings.addServer(server("MyFeed", "user", "stale-pat"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.error(new RuntimeException("no az login")));
+    AzureDevOpsCredentialsExtension ext = extensionWithProbeStub(mockCredential, 401, 401);
+
+    ext.afterProjectsRead(session);
+
+    // Stale entry left as-is — degrades to pre-0.0.8 behavior (build will 401).
+    assertEquals("stale-pat", settings.getServer("MyFeed").getPassword());
+  }
+
+  @Test
+  public void afterProjectsRead_validEntry_alwaysMode_keepsEntry() throws Exception {
+    useValidationMode("always");
+    settings.addServer(server("MyFeed", "user", "good-pat"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    AzureDevOpsCredentialsExtension ext = extensionWithProbeStub(mockCredential, 200);
+
+    ext.afterProjectsRead(session);
+
+    // Entry trusted because probe was 200 — no credential acquisition at all.
+    assertEquals("good-pat", settings.getServer("MyFeed").getPassword());
+    verify(mockCredential, never()).getToken(any());
+  }
+
+  @Test
+  public void afterProjectsRead_nonAdoEntry_neverProbed() throws Exception {
+    useValidationMode("always");
+    Repository nonAdoRepo = repo("CentralMirror", "https://repo1.maven.org/maven2/");
+    settings.addServer(server("CentralMirror", "user", "anything"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(nonAdoRepo));
+    AzureDevOpsCredentialsExtension ext = extensionWithProbeStub(mockCredential, 401);
+
+    ext.afterProjectsRead(session);
+
+    // No mutation, no acquisition — non-ADO URL bypasses the probe entirely.
+    assertEquals("anything", settings.getServer("CentralMirror").getPassword());
+    verify(mockCredential, never()).getToken(any());
+  }
+
+  @Test
+  public void afterProjectsRead_staleEntry_neverMode_keepsEntry() throws Exception {
+    // @Before sets validation mode to "never" — preserve and assert it skips probing.
+    settings.addServer(server("MyFeed", "user", "stale-pat"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    AzureDevOpsCredentialsExtension ext = extensionWithProbeStub(mockCredential, 401);
+
+    ext.afterProjectsRead(session);
+
+    assertEquals("stale-pat", settings.getServer("MyFeed").getPassword());
+    verify(mockCredential, never()).getToken(any());
+  }
+
+  @Test
+  public void existingServerUsable_cachesPerRepoId() throws Exception {
+    useValidationMode("always");
+    settings.addServer(server("MyFeed", "user", "stale"));
+    // Two projects pointing at the SAME repoId; probeStatus should be called
+    // at most once per repoId, not twice.
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    final java.util.concurrent.atomic.AtomicInteger probes =
+        new java.util.concurrent.atomic.AtomicInteger();
+    AzureDevOpsCredentialsExtension ext =
+        new AzureDevOpsCredentialsExtension() {
+          @Override
+          TokenCredential createCredential() {
+            return mockCredential;
+          }
+
+          @Override
+          int probeStatus(String url, String authorization, MavenSession s) {
+            probes.incrementAndGet();
+            return 200; // trust → no mutation, no token acquisition
+          }
+        };
+    Field f = AzureDevOpsCredentialsExtension.class.getDeclaredField("repositorySystem");
+    f.setAccessible(true);
+    f.set(ext, repositorySystem);
+
+    // Two back-to-back lifecycle hooks (e.g., mvnd reusing the extension) —
+    // afterSessionStart clears the cache, so the SECOND afterProjectsRead
+    // re-probes. The point of THIS test is the WITHIN-build cache, so run
+    // afterProjectsRead once with two collect calls and verify probes == 1.
+    when(project.getPluginRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    ext.afterProjectsRead(session);
+    // getRepositories AND getPluginRepositories both point at MyFeed →
+    // collectAzureDevOpsRepoIds runs twice → existingServerUsable runs twice
+    // → second call must hit cache.
+    assertEquals(1, probes.get());
+  }
+
+  @Test
+  public void afterSessionStart_clearsProbeCache() throws Exception {
+    // First "build": cache the probe result.
+    useValidationMode("always");
+    settings.addServer(server("MyFeed", "user", "stale"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    final java.util.concurrent.atomic.AtomicInteger probes =
+        new java.util.concurrent.atomic.AtomicInteger();
+    AzureDevOpsCredentialsExtension ext =
+        new AzureDevOpsCredentialsExtension() {
+          @Override
+          TokenCredential createCredential() {
+            return mockCredential;
+          }
+
+          @Override
+          int probeStatus(String url, String authorization, MavenSession s) {
+            probes.incrementAndGet();
+            return 200;
+          }
+        };
+    Field f = AzureDevOpsCredentialsExtension.class.getDeclaredField("repositorySystem");
+    f.setAccessible(true);
+    f.set(ext, repositorySystem);
+    ext.afterProjectsRead(session);
+    assertEquals(1, probes.get());
+
+    // Second "build" — mvnd reuses the instance, calls afterSessionStart again.
+    ext.afterSessionStart(session);
+    ext.afterProjectsRead(session);
+    assertEquals(
+        "Cache must be cleared by afterSessionStart so a rotated PAT is re-checked",
+        2,
+        probes.get());
+  }
+
+  // --- decryptPassword ---
+
+  @Test
+  public void decryptPassword_nullDecrypter_returnsRawPassword() throws Exception {
+    // The default extensionWith does NOT inject SettingsDecrypter, so it remains null.
+    Server s = server("X", "u", "encrypted-literal");
+    assertEquals("encrypted-literal", extension.decryptPassword(s));
+  }
+
+  @Test
+  public void decryptPassword_decrypterReturnsServer_returnsDecryptedPassword() throws Exception {
+    SettingsDecrypter decrypter = mock(SettingsDecrypter.class);
+    SettingsDecryptionResult result = mock(SettingsDecryptionResult.class);
+    Server decrypted = server("X", "u", "real-secret");
+    when(result.getServer()).thenReturn(decrypted);
+    when(decrypter.decrypt(any())).thenReturn(result);
+
+    Field f = AzureDevOpsCredentialsExtension.class.getDeclaredField("settingsDecrypter");
+    f.setAccessible(true);
+    f.set(extension, decrypter);
+
+    assertEquals("real-secret", extension.decryptPassword(server("X", "u", "{ENC...}")));
+  }
+
+  @Test
+  public void decryptPassword_decrypterReturnsNullServer_fallsBackToRaw() throws Exception {
+    SettingsDecrypter decrypter = mock(SettingsDecrypter.class);
+    SettingsDecryptionResult result = mock(SettingsDecryptionResult.class);
+    when(result.getServer()).thenReturn(null);
+    when(decrypter.decrypt(any())).thenReturn(result);
+
+    Field f = AzureDevOpsCredentialsExtension.class.getDeclaredField("settingsDecrypter");
+    f.setAccessible(true);
+    f.set(extension, decrypter);
+
+    assertEquals("raw", extension.decryptPassword(server("X", "u", "raw")));
+  }
+
+  @Test
+  public void afterProjectsRead_staleEntry_alwaysMode_tokenAcquisitionFails_logsInfoAndKeepsStale()
+      throws Exception {
+    // Coverage gate: lines 387-393 — the "no token but stale entries pending override" branch.
+    // In `always` mode, the probe marks the entry stale regardless of Entra reachability;
+    // the boot fetch then fails (no `az login`), so the override never runs. The entry
+    // stays stale in settings.xml — same outcome as today, but with a diagnostic INFO so
+    // the user understands why the eventual 401 happens.
+    useValidationMode("always");
+    settings.addServer(server("MyFeed", "user", "stale-pat"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(mockCredential.getToken(any()))
+        .thenReturn(Mono.error(new RuntimeException("no az login")));
+    AzureDevOpsCredentialsExtension ext = extensionWithProbeStub(mockCredential, 401);
+
+    ext.afterProjectsRead(session);
+
+    // Stale entry unchanged.
+    assertEquals("stale-pat", settings.getServer("MyFeed").getPassword());
+  }
+
+  @Test
+  public void afterProjectsRead_multipleStaleEntries_alwaysMode_tokenFails_logsInfoForEach()
+      throws Exception {
+    // Same as above with multiple stale entries — covers the per-entry loop body at line 388.
+    useValidationMode("always");
+    settings.addServer(server("FeedA", "user", "stale-A"));
+    settings.addServer(server("FeedB", "user", "stale-B"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("FeedA"), adoRepo("FeedB")));
+    when(mockCredential.getToken(any())).thenReturn(Mono.empty());
+    AzureDevOpsCredentialsExtension ext = extensionWithProbeStub(mockCredential, 401);
+
+    ext.afterProjectsRead(session);
+
+    assertEquals("stale-A", settings.getServer("FeedA").getPassword());
+    assertEquals("stale-B", settings.getServer("FeedB").getPassword());
+  }
+
+  // ===== Probe-timeout knob (PROBE_TIMEOUT_PROPERTY) =====
+
+  /**
+   * Wrap a body that needs a specific {@code dev.chungmin.azure.probeTimeoutMillis} value so that
+   * the prior property state is restored on exit. Centralizes the System.clearProperty/restore
+   * boilerplate so timeout tests don't leak global state into sibling tests.
+   */
+  private static void withProbeTimeoutProperty(String value, Runnable body) {
+    String key = AzureDevOpsCredentialsExtension.PROBE_TIMEOUT_PROPERTY;
+    String prior = System.getProperty(key);
+    try {
+      if (value == null) {
+        System.clearProperty(key);
+      } else {
+        System.setProperty(key, value);
+      }
+      body.run();
+    } finally {
+      if (prior == null) {
+        System.clearProperty(key);
+      } else {
+        System.setProperty(key, prior);
+      }
+    }
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_unsetReturnsDefault() {
+    withProbeTimeoutProperty(
+        null,
+        () ->
+            assertEquals(
+                AzureDevOpsCredentialsExtension.DEFAULT_PROBE_TIMEOUT_MILLIS,
+                extension.resolveProbeTimeoutMillis(null)));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_validValueParsed() {
+    withProbeTimeoutProperty(
+        "30000", () -> assertEquals(30000, extension.resolveProbeTimeoutMillis(null)));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_whitespacePaddedValueParsed() {
+    // Mirrors normalizeMode's tolerance for shell-quoting whitespace.
+    withProbeTimeoutProperty(
+        "  12345  ", () -> assertEquals(12345, extension.resolveProbeTimeoutMillis(null)));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_unparseableValueFallsBackToDefault() {
+    withProbeTimeoutProperty(
+        "not-a-number",
+        () ->
+            assertEquals(
+                AzureDevOpsCredentialsExtension.DEFAULT_PROBE_TIMEOUT_MILLIS,
+                extension.resolveProbeTimeoutMillis(null)));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_zeroFallsBackToDefault() {
+    // Zero would mean "infinite timeout" in HttpURLConnection's API, which is the opposite of
+    // what the user almost certainly meant — treat as misconfiguration.
+    withProbeTimeoutProperty(
+        "0",
+        () ->
+            assertEquals(
+                AzureDevOpsCredentialsExtension.DEFAULT_PROBE_TIMEOUT_MILLIS,
+                extension.resolveProbeTimeoutMillis(null)));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_negativeFallsBackToDefault() {
+    withProbeTimeoutProperty(
+        "-5",
+        () ->
+            assertEquals(
+                AzureDevOpsCredentialsExtension.DEFAULT_PROBE_TIMEOUT_MILLIS,
+                extension.resolveProbeTimeoutMillis(null)));
+  }
+
+  // R2 fix: mirror the 4-channel precedence resolveValidationMode honors. Without these channels,
+  // a POM-pinned timeout (or a MAVEN_OPTS-set knob) would silently degrade to the default.
+
+  @Test
+  public void resolveProbeTimeoutMillis_userPropertyConsultedFirst() {
+    java.util.Properties userProps = new java.util.Properties();
+    userProps.setProperty(AzureDevOpsCredentialsExtension.PROBE_TIMEOUT_PROPERTY, "11111");
+    when(session.getUserProperties()).thenReturn(userProps);
+    assertEquals(11111, extension.resolveProbeTimeoutMillis(session));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_systemPropertyConsultedWhenUserPropertyUnset() {
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    java.util.Properties sysProps = new java.util.Properties();
+    sysProps.setProperty(AzureDevOpsCredentialsExtension.PROBE_TIMEOUT_PROPERTY, "22222");
+    when(session.getSystemProperties()).thenReturn(sysProps);
+    assertEquals(22222, extension.resolveProbeTimeoutMillis(session));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_userPropertyOverridesSystemProperty() {
+    java.util.Properties userProps = new java.util.Properties();
+    userProps.setProperty(AzureDevOpsCredentialsExtension.PROBE_TIMEOUT_PROPERTY, "11111");
+    when(session.getUserProperties()).thenReturn(userProps);
+    java.util.Properties sysProps = new java.util.Properties();
+    sysProps.setProperty(AzureDevOpsCredentialsExtension.PROBE_TIMEOUT_PROPERTY, "22222");
+    when(session.getSystemProperties()).thenReturn(sysProps);
+    assertEquals(11111, extension.resolveProbeTimeoutMillis(session));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_pomPropertyConsultedWhenSystemPropertyUnset() {
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    when(session.getSystemProperties()).thenReturn(new java.util.Properties());
+    java.util.Properties pomProps = new java.util.Properties();
+    pomProps.setProperty(AzureDevOpsCredentialsExtension.PROBE_TIMEOUT_PROPERTY, "33333");
+    when(project.getProperties()).thenReturn(pomProps);
+    assertEquals(33333, extension.resolveProbeTimeoutMillis(session));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_systemPropertyOverridesPomProperty() {
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    java.util.Properties sysProps = new java.util.Properties();
+    sysProps.setProperty(AzureDevOpsCredentialsExtension.PROBE_TIMEOUT_PROPERTY, "22222");
+    when(session.getSystemProperties()).thenReturn(sysProps);
+    java.util.Properties pomProps = new java.util.Properties();
+    pomProps.setProperty(AzureDevOpsCredentialsExtension.PROBE_TIMEOUT_PROPERTY, "33333");
+    when(project.getProperties()).thenReturn(pomProps);
+    assertEquals(22222, extension.resolveProbeTimeoutMillis(session));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_jvmSystemPropertyFallbackUsedWhenSessionAllChannelsUnset() {
+    // Session has empty user/system properties and the POM property is unset too — the final
+    // System.getProperty fallback kicks in. This preserves the behavior tests that use the
+    // withProbeTimeoutProperty helper rely on (session-less / null-session contexts).
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    when(session.getSystemProperties()).thenReturn(new java.util.Properties());
+    when(project.getProperties()).thenReturn(new java.util.Properties());
+    withProbeTimeoutProperty(
+        "44444", () -> assertEquals(44444, extension.resolveProbeTimeoutMillis(session)));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_handlesEmptyProjects() {
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    when(session.getSystemProperties()).thenReturn(new java.util.Properties());
+    when(session.getProjects()).thenReturn(Collections.emptyList());
+    assertEquals(
+        AzureDevOpsCredentialsExtension.DEFAULT_PROBE_TIMEOUT_MILLIS,
+        extension.resolveProbeTimeoutMillis(session));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_handlesNullProjects() {
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    when(session.getSystemProperties()).thenReturn(new java.util.Properties());
+    when(session.getProjects()).thenReturn(null);
+    assertEquals(
+        AzureDevOpsCredentialsExtension.DEFAULT_PROBE_TIMEOUT_MILLIS,
+        extension.resolveProbeTimeoutMillis(session));
+  }
+
+  @Test
+  public void resolveProbeTimeoutMillis_handlesNullSystemProperties() {
+    when(session.getUserProperties()).thenReturn(new java.util.Properties());
+    when(session.getSystemProperties()).thenReturn(null);
+    assertEquals(
+        AzureDevOpsCredentialsExtension.DEFAULT_PROBE_TIMEOUT_MILLIS,
+        extension.resolveProbeTimeoutMillis(session));
+  }
+
+  @Test
+  public void probeStatus_honorsCustomTimeout() throws Exception {
+    // Verify probeStatus actually reads the system property (not just hard-codes 5000).
+    // Strategy: set the timeout very low (1 ms), then probe a host that won't accept the
+    // connection within that window. The probe must return 0 (its IOException fallback).
+    // Without the fix, the hard-coded 5000ms would let the test machine's localhost-:1
+    // connect-refused IOException surface immediately too, so this test isn't 100%
+    // discriminating on a healthy stack — but combined with the resolveProbeTimeoutMillis_*
+    // tests above it confirms the wiring.
+    withProbeTimeoutProperty(
+        "1",
+        () -> {
+          // Port 1 has nothing listening — fast connect-refused either way; the point is the
+          // call goes through without throwing the wrong exception. We're really asserting
+          // "no NPE / no IllegalArgumentException / no integer-overflow from a bad parse".
+          assertEquals(0, extension.probeStatus("http://localhost:1/", "Basic dTpw"));
+        });
+  }
+
+  // ===== Bearer-verify treats 401 and 403 symmetrically (no-feed-access path) =====
+
+  @Test
+  public void afterProjectsRead_staleEntry_autoMode_entraReturns403_keepsStaleEntry()
+      throws Exception {
+    // Regression: pre-fix, a 403 from the Bearer-verify probe (auth recognized but not
+    // authorized — what an HTTP-layer authz service would naturally return for missing-role)
+    // bypassed the "no feed access" guard because the check was `verifyStatus == 401` only.
+    // Result: extension would override the stale PAT with the no-access Entra token, build
+    // would still 401/403 downstream, and the user would see a misleading "Overrode stale"
+    // log. Fix: treat 401 OR 403 as "this Entra token can't access the feed".
+    useValidationMode("auto");
+    settings.addServer(server("MyFeed", "user", "stale-pat"));
+    when(project.getRepositories()).thenReturn(Arrays.asList(adoRepo("MyFeed")));
+    when(mockCredential.getToken(any()))
+        .thenReturn(
+            Mono.just(new AccessToken("mi-no-feed-access", OffsetDateTime.now().plusHours(1))));
+    AzureDevOpsCredentialsExtension ext = extensionWithProbeStub(mockCredential, 401, 403);
+
+    ext.afterProjectsRead(session);
+
+    // Stale entry retained — neither 401 nor 403 should let the override fire.
+    assertEquals("stale-pat", settings.getServer("MyFeed").getPassword());
   }
 }
